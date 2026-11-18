@@ -1,0 +1,10 @@
+// triggerlook: the triggers' fill and border (colour + alpha per vertex, from the trigger menu), unlit.
+// $decal: the decal depth bias, so a trigger side lying on a wall or floor shows instead of flickering with it.
+"UnlitGeneric"
+{
+	"$basetexture" "vgui/white"
+	"$vertexcolor" 1
+	"$vertexalpha" 1
+	"$translucent" 1
+	"$decal" 1
+}

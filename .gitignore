@@ -1,0 +1,12 @@
+third_party/source-sdk-2013
+build/
+install/
+win/build/
+src/tl_files.h
+__pycache__/
+*.o
+*.so
+*.dll
+*.exe
+*.lib
+dist/

@@ -1,0 +1,4 @@
+{
+  global: TriggerLook_Init; triggerlook_enable_set;
+  local: *;
+};
