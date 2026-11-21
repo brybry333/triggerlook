@@ -1,0 +1,6 @@
+// triggerlook: writes depth only (no colour), drawn right before the triggers over the world surfaces a map draws
+// see-through although they look solid ($translucent on a texture without see-through pixels), so those hide the
+// triggers behind them like any other wall or floor.
+"DepthWrite"
+{
+}

@@ -13,7 +13,9 @@
 TLLook_t g_TLLook[TL_TYPES];
 int g_TLCustom[3] = { 255, 165, 0 };
 int g_nTLTypeVersion[TL_TYPES] = { 1, 2, 3, 4, 5, 6 };
-bool g_bTLShow;		// the menu's ON / OFF: off = the game's own trigger look, nothing of ours
+bool g_bTLShow;
+std::string g_TLPickKey, g_TLPickBind;
+static std::vector<std::string> s_KeepLines;	// lines this version doesn't know (another version's): written back		// the menu's ON / OFF: off = the game's own trigger look, nothing of ours
 std::vector<TLCustomTrigger_t> g_TLCT;
 int g_nTLCTListVersion;
 
@@ -38,6 +40,9 @@ void TL_LookDefaults()
 	c.show = false;
 	c.fill[0] = 255; c.fill[1] = 80; c.fill[2] = 200; c.fill[3] = 50;
 	g_bTLShow = false;
+	g_TLPickKey.clear();
+	g_TLPickBind.clear();
+	s_KeepLines.clear();
 	g_TLCustom[0] = 255; g_TLCustom[1] = 165; g_TLCustom[2] = 0;
 	g_TLCT.clear();
 	g_nTLCTListVersion++;
@@ -147,6 +152,18 @@ bool TL_LookLoad()
 	{
 		const bool ctBefore = afterCT;
 		afterCT = false;
+		if ( !strncmp( line, "pick ", 5 ) )
+		{
+			// "pick <key> <its own bind>" (the bind may have spaces, or be empty)
+			std::string rest = line + 5;
+			while ( !rest.empty() && ( rest.back() == '\n' || rest.back() == '\r' ) )
+				rest.pop_back();
+			const size_t sp = rest.find( ' ' );
+			g_TLPickKey = rest.substr( 0, sp );
+			g_TLPickBind = sp == std::string::npos ? "" : rest.substr( sp + 1 );
+			continue;
+		}
+		const std::string raw = line;
 		if ( !strncmp( line, "ctname ", 7 ) )
 		{
 			std::string name = line + 7;
@@ -190,7 +207,14 @@ bool TL_LookLoad()
 		}
 		int mask = TL_TypeMask( tok[0] );
 		if ( !mask || mask == ( 1 << TL_TYPES ) - 1 )
+		{
+			std::string keep = raw;
+			while ( !keep.empty() && ( keep.back() == '\n' || keep.back() == '\r' ) )
+				keep.pop_back();
+			if ( s_KeepLines.size() < 256 && keep.size() < 500 )
+				s_KeepLines.push_back( keep );
 			continue;
+		}
 		ParseLook( tok, 1, n, g_TLLook[__builtin_ctz( mask )] );
 	}
 	fclose( f );
@@ -212,6 +236,8 @@ bool TL_LookSave()
 	}
 	fprintf( f, "# triggerlook settings (the trigger menu writes this file)\n" );
 	fprintf( f, "triggers %d\n", g_bTLShow ? 1 : 0 );
+	if ( !g_TLPickKey.empty() )
+		fprintf( f, "pick %s %s\n", g_TLPickKey.c_str(), g_TLPickBind.c_str() );
 	for ( int t = 0; t < TL_TYPES; t++ )
 	{
 		const TLLook_t &l = g_TLLook[t];
@@ -228,6 +254,8 @@ bool TL_LookSave()
 		if ( !ct.name.empty() )
 			fprintf( f, "ctname %s\n", ct.name.c_str() );
 	}
+	for ( const std::string &l : s_KeepLines )
+		fprintf( f, "%s\n", l.c_str() );
 	bool ok = fclose( f ) == 0 && TLP_ReplaceFile( tmp, TL_LookPath() );
 	if ( !ok )
 		Warning( "triggerlook: can't write %s\n", TL_LookPath() );

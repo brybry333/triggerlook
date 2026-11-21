@@ -119,7 +119,8 @@ only `TriggerLook_Init` and `triggerlook_enable_set`.
 **Test:** `LD_LIBRARY_PATH=<game>/bin/linux64 build/geomtest <game>/cstrike maps/<map>.bsp` reads a map's triggers
 and checks every side and its mesh (flat, convex, facing out, closed solids, band and fill covering each side
 exactly once, the drawn shape half a unit out on every side). `GEOM_WIDTH=<n>` sets the border width, `GEOM_LIST=1`
-lists the triggers.
+lists the triggers. `python3 tools/hostile_maps.py <map.bsp> <dir>` writes a crafted copy of a map (every brush
+one-sided, every trigger re-reading all of them) that geomtest has to read in about the real map's time.
 
 ## Files
 
@@ -135,7 +136,7 @@ lists the triggers.
 | `src/loader/triggerlook_loader.c` | `libtriggerlook.so`, the Linux preload that loads the mod |
 | `win/launcher.c` | `triggerlook.exe` |
 | `game/` | the material and the menu font (embedded into the mod by `tools/embed.py`) |
-| `tools/geomtest.cpp` | the offline map test |
+| `tools/geomtest.cpp`, `tools/hostile_maps.py` | the offline map test, a crafted-map maker for it |
 | `tools/wininject.c`, `tools/wininput.c`, `tools/xclick.c` | test helpers (load the DLL; drive the menu with real input) |
 
 ## Credits

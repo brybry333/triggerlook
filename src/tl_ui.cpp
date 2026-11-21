@@ -408,7 +408,8 @@ class CTLTicker : public CTLBasePanel
 {
 public:
 	CTLTicker() : CTLBasePanel( "TriggerLookTicker" ) {}
-	virtual void Paint() { if ( s_bPicking ) PaintPickBar(); }
+	virtual void Paint() { PaintPickBar(); }
+	virtual void PaintTraverse( bool forceRepaint, bool allowForce ) { if ( s_bPicking ) CTLBasePanel::PaintTraverse( forceRepaint, allowForce ); }
 	virtual void OnTick() { TL_Tick(); }
 };
 static CTLTicker s_Ticker;
@@ -1189,7 +1190,7 @@ private:
 		int ly = y + S( 124 ) + TextH( F_BOLD ) + TextH( F_SMALL ) + S( 18 );
 		Text( F_SMALL, rx, ly, C_SUB, on.c_str() );
 		for ( int t = 0; t < TL_TYPES; t++ )
-			if ( m_nSel & ( 1 << t ) )
+			if ( ( m_nSel & ( 1 << t ) ) && ly + 2 * ( TextH( F_SMALL ) + S( 2 ) ) < y + sv - S( 42 ) )
 			{
 				ly += TextH( F_SMALL ) + S( 2 );
 				Text( F_SMALL, rx, ly, C_TEXT, g_TLTypeLabel[t] );
@@ -1210,8 +1211,9 @@ static CTLMenu s_Menu;
 //-----------------------------------------------------------------------------
 // SELECT TRIGGER: the menu closes, you look around, and the +attack key (left click) picks the drawn trigger under
 // the crosshair (lit up white, tl_runtime.cpp): it becomes a custom trigger and the menu opens again with it picked.
-// The key is borrowed while picking (bound to +triggerlook_pick, so it doesn't shoot) and given back after; a key
-// still bound to it (the game closed mid-pick) gets +attack back on the next map. Esc = back to the menu.
+// The key is borrowed while picking (bound to +triggerlook_pick, so it doesn't shoot) and given back after. Its own
+// bind is saved in the settings file at once: the game closing mid-pick (Alt+F4) gets it back on the next map (a key
+// still bound to +triggerlook_pick without a saved bind gets +attack). Esc = back to the menu.
 //-----------------------------------------------------------------------------
 static std::string s_PickKey, s_PickKeyOld;	// the borrowed key ("MOUSE1") and its bind
 static bool s_bReopenMenu;					// Esc: back to the menu once the pause menu is gone
@@ -1244,6 +1246,9 @@ static void StartPick()
 	s_PickKeyOld = key && *key ? "+attack" : mouse1 ? mouse1 : "";
 	if ( s_PickKeyOld == "+triggerlook_pick" )
 		s_PickKeyOld = "+attack";
+	g_TLPickKey = s_PickKey;
+	g_TLPickBind = s_PickKeyOld;
+	TL_LookSave();
 	SetBind( s_PickKey.c_str(), "+triggerlook_pick" );
 	s_nPickDown = s_nPicked = -1;
 	SetMenuOpen( false );
@@ -1259,6 +1264,13 @@ static void EndPick( bool reopen, int model )
 	s_bPicking = false;
 	TL_SetPicking( false );
 	SetBind( s_PickKey.c_str(), s_PickKeyOld );
+	if ( s_pEngine->IsInGame() )
+	{
+		// (leaving the game: that bind command can run after the game wrote its config - the next map checks it)
+		g_TLPickKey.clear();
+		g_TLPickBind.clear();
+		TL_LookSave();
+	}
 	const int ct = model >= 0 ? TL_PickedCT( model ) : -1;
 	if ( !reopen )
 		return;
@@ -1331,7 +1343,19 @@ void TLUI_Tick()
 	else if ( s_pEngine->IsInGame() && strcmp( s_szBindsChecked, s_pEngine->GetLevelName() ) )
 	{
 		TL_StrCopy( s_szBindsChecked, s_pEngine->GetLevelName(), sizeof( s_szBindsChecked ) );
-		if ( const char *key = s_pEngine->Key_LookupBinding( "+triggerlook_pick" ) )
+		if ( !g_TLPickKey.empty() )
+		{
+			const char *still = s_pEngine->Key_LookupBinding( "+triggerlook_pick" );
+			if ( still && !TL_StrICmp( still, g_TLPickKey.c_str() ) )
+			{
+				SetBind( g_TLPickKey.c_str(), g_TLPickBind );
+				Msg( "triggerlook: gave %s its bind back (the game closed while picking a trigger)\n", g_TLPickKey.c_str() );
+			}
+			g_TLPickKey.clear();
+			g_TLPickBind.clear();
+			TL_LookSave();
+		}
+		else if ( const char *key = s_pEngine->Key_LookupBinding( "+triggerlook_pick" ) )
 		{
 			SetBind( key, "+attack" );
 			Msg( "triggerlook: gave %s back to +attack (the game closed while picking a trigger)\n", key );
@@ -1394,6 +1418,14 @@ static void SetMenuOpen( bool open )
 	{
 		EndPick( false, -1 );		// (triggerlook_menu while picking: back to the menu)
 		s_bReopenMenu = false;
+		if ( s_pEngineVGui && s_pEngineVGui->IsGameUIVisible() )
+		{
+			// typed in the console: the menu would see the pause UI on its first frame and close again
+			if ( s_pEngine )
+				s_pEngine->ClientCmd_Unrestricted( "hideconsole\ngameui_hide\n" );
+			s_bReopenMenu = true;
+			return;
+		}
 	}
 	if ( open && s_pEngine && s_pEngine->Con_IsVisible() )
 		s_pEngine->ClientCmd_Unrestricted( "hideconsole" );
@@ -1404,6 +1436,7 @@ static void SetMenuOpen( bool open )
 	{
 		s_Menu.EndRename( true );
 		TL_LookFlush();		// (a quit right after closing keeps the change)
+		TL_PrebuildMeshes();
 	}
 	s_Menu.Show( open );
 }

@@ -28,6 +28,7 @@ int TL_CTType( int index );			// the type of its trigger, -1 = not on this map
 int TL_ModelType( int model );		// the type of trigger *model, -1 = not a trigger
 // SELECT TRIGGER: while picking, the drawn trigger under the crosshair is lit up
 void TL_SetPicking( bool on );
+void TL_PrebuildMeshes();		// every trigger's mesh in its current look (after edits: no rebuilds mid-game)
 int TL_PickHover();					// its model number, -1 = none
 int TL_ModelCT( int model );			// trigger *model's custom trigger, -1 = none
 int TL_PickedCT( int model );		// that trigger's custom trigger (made from its type's look if it has none), -1 = none

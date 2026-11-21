@@ -23,6 +23,7 @@ enum { TL_MAX_WIDTH = 16 };
 extern TLLook_t g_TLLook[TL_TYPES];
 extern int g_TLCustom[3];			// the last custom colour (the menu's custom block)
 extern int g_nTLTypeVersion[TL_TYPES];	// a new number when a type's look changes (its meshes rebuild)
+extern std::string g_TLPickKey, g_TLPickBind;	// SELECT TRIGGER running: the borrowed key and its own bind (saved at once)
 extern bool g_bTLShow;				// ON / OFF (the menu's switch, triggerlook_show): draw the map's triggers at all
 
 // A trigger picked in the world (the menu's SELECT TRIGGER): its own look on its map, over its type's (also when the

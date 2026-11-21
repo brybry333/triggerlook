@@ -58,6 +58,9 @@ struct TLMapFile
 };
 // opens a map the way the engine finds it (its filesystem: custom/, the game folder, VPKs, download/); NULL = no
 typedef TLMapFile *( *TLOpenMapFn )( const char *level );
+// true = a world material that the game draws see-through ($translucent) although its texture has no see-through pixel
+// (a map's mistake): such surfaces look solid, so they hide the triggers behind them (name as in the map, any case)
+typedef bool ( *TLSolidLookingFn )( const char *material );
 
 class CTLMap
 {
@@ -66,7 +69,7 @@ public:
 
 	// pszLevel = engine->GetLevelName() ("maps/foo.bsp"), opened with pfnOpen (in the game: its filesystem); without
 	// one (offline tools) the loose file is looked up in pszGameDir the engine's way. False on error.
-	bool Load( const char *pszGameDir, const char *pszLevel, TLOpenMapFn pfnOpen = NULL );
+	bool Load( const char *pszGameDir, const char *pszLevel, TLOpenMapFn pfnOpen = NULL, TLSolidLookingFn pfnSolidLooking = NULL );
 	void Clear();
 
 	// brush model *index if it's a trigger with a shape, else NULL
@@ -85,7 +88,12 @@ public:
 	void BoxClusters( const Vector &mins, const Vector &maxs, std::vector<int> &out ) const;
 	int PointCluster( const Vector &p ) const;
 	bool ClusterPVS( int cluster, std::vector<unsigned char> &bits ) const;
-	bool HasVis() const { return m_nClusters > 0; }
+
+	// the world's solid-looking see-through surfaces (pfnSolidLooking), world space: polygon k = m_OccVerts
+	// [m_OccFirst[k], m_OccFirst[k + 1])
+	std::vector<Vector> m_OccVerts;
+	std::vector<int> m_OccFirst;
+	std::vector<std::string> m_OccMaterials;
 
 private:
 	struct Plane_t { Vector n; float d; };
@@ -95,6 +103,8 @@ private:
 	std::vector<short> m_LeafCluster;
 	std::vector<unsigned char> m_Vis;	// the visibility lump as is
 	int		m_nClusters = 0, m_nWorldHead = 0;
+	mutable std::vector<char> m_ClusterMark, m_NodeMark;	// BoxClusters' scratch (cleared after each call)
+	mutable std::vector<int> m_Stack, m_Visited;
 
 	std::vector<TLModel_t> m_Models;	// by brush model number (*N); 0 = the world, never a trigger; then the clips
 	char	m_szLevel[260];

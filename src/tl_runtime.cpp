@@ -10,10 +10,8 @@
 // Everything goes through interfaces the game exports (CreateInterface), no hooks; the same code on Linux and
 // Windows (only tl_platform_*.cpp differs; the SDK's headers give each OS its own interface layout):
 //   engine             VEngineClient014        level name, console commands
-//                      VModelInfoClient006     model names ("*12")
 //                      EngineTraceClient003    SELECT TRIGGER: where the crosshair meets the world
-//   client             ClientLeafSystem002     AddRenderable (slot 4), checked against CS:S client.so
-//                      VClientEntityList003    the client's entities (triggerlook_ents only)
+//   client             ClientLeafSystem002     AddRenderable (slot 4) / RemoveRenderable, checked against CS:S client.so
 //   materialsystem     VMaterialSystem082      materials, render context
 //   filesystem_stdio   VBaseFileSystem011      maps that aren't loose files
 //   vstdlib            VEngineCvar004          our console commands (tl_con.cpp), the setting-change callback
@@ -29,6 +27,8 @@
 
 #include <algorithm>
 #include <atomic>
+#include <ctype.h>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -43,11 +43,8 @@
 #include "iclientunknown.h"
 #include "iclientnetworkable.h"
 #include "icliententity.h"
-#include "icliententitylist.h"
-#include "client_class.h"
 #include "basehandle.h"
 #include "worldsize.h"
-#include "engine/ivmodelinfo.h"
 #include "engine/IClientLeafSystem.h"
 #include "materialsystem/imaterialsystem.h"
 #include "materialsystem/imaterial.h"
@@ -74,28 +71,18 @@
 #define TL_EXPORT extern "C" __attribute__( ( visibility( "default" ) ) )
 #endif
 
-// The leading part of client.so's IClientLeafSystem vtable (game/client/clientleafsystem.h); only AddRenderable
-// is called, the slots in between keep the layout.
+// The leading part of client.so's IClientLeafSystem vtable (game/client/clientleafsystem.h): AddRenderable (slot 4)
+// after the engine part's four (RemoveRenderable = slot 1)
 abstract_class ITLLeafSystem : public IClientLeafSystemEngine
 {
 public:
 	virtual void AddRenderable( IClientRenderable *pRenderable, RenderGroup_t group ) = 0;		// slot 4
-	virtual bool IsRenderableInPVS( IClientRenderable *pRenderable ) = 0;
-	virtual void SetSubSystemDataInLeaf( int leaf, int nSubSystemIdx, void *pData ) = 0;
-	virtual void *GetSubSystemDataInLeaf( int leaf, int nSubSystemIdx ) = 0;
-	virtual void SetDetailObjectsInLeaf( int leaf, int firstDetailObject, int detailObjectCount ) = 0;
-	virtual void GetDetailObjectsInLeaf( int leaf, int &firstDetailObject, int &detailObjectCount ) = 0;
-	virtual void DrawDetailObjectsInLeaf( int leaf, int frameNumber, int &firstDetailObject, int &detailObjectCount ) = 0;
-	virtual bool ShouldDrawDetailObjectsInLeaf( int leaf, int frameNumber ) = 0;
-	virtual void RenderableChanged( ClientRenderHandle_t handle ) = 0;							// slot 12
 };
 
 static IVEngineClient *s_pEngine;
 static ITLLeafSystem *s_pLeafSystem;
 static IMaterialSystem *s_pMatSys;
-static IVModelInfoClient *s_pModelInfo;
 static IBaseFileSystem *s_pFileSystem;
-static IClientEntityList *s_pEntList;
 static IBaseClientDLL *s_pClient;		// GetPlayerView: which view is the player's
 static IEngineTrace *s_pTrace;			// SELECT TRIGGER (without it the world doesn't hide triggers from the pick)
 
@@ -132,13 +119,18 @@ static bool ConnectInterfaces()
 {
 	if ( !s_pEngine )		s_pEngine = (IVEngineClient *)TLP_Interface( "engine", "VEngineClient014" );
 	if ( !s_pLeafSystem )	s_pLeafSystem = (ITLLeafSystem *)TLP_Interface( "client", "ClientLeafSystem002" );
-	if ( !s_pEntList )		s_pEntList = (IClientEntityList *)TLP_Interface( "client", VCLIENTENTITYLIST_INTERFACE_VERSION );
 	if ( !s_pMatSys )		s_pMatSys = (IMaterialSystem *)TLP_Interface( "materialsystem", "VMaterialSystem082" );
-	if ( !s_pModelInfo )	s_pModelInfo = (IVModelInfoClient *)TLP_Interface( "engine", VMODELINFO_CLIENT_INTERFACE_VERSION );
-	if ( !s_pFileSystem )	s_pFileSystem = (IBaseFileSystem *)TLP_Interface( "filesystem_stdio", "VBaseFileSystem011" );
-	if ( !s_pClient )		s_pClient = (IBaseClientDLL *)TLP_Interface( "client", CLIENT_DLL_INTERFACE_VERSION );
-	if ( !s_pTrace )		s_pTrace = (IEngineTrace *)TLP_Interface( "engine", INTERFACEVERSION_ENGINETRACE_CLIENT );
-	return s_pEngine && s_pLeafSystem && s_pEntList && s_pMatSys && s_pModelInfo;
+	const bool ok = s_pEngine && s_pLeafSystem && s_pMatSys;
+	// the optional ones once (a missing one would otherwise be searched for twice a frame)
+	static bool s_bOptionalTried;
+	if ( ok && !s_bOptionalTried )
+	{
+		s_bOptionalTried = true;
+		s_pFileSystem = (IBaseFileSystem *)TLP_Interface( "filesystem_stdio", "VBaseFileSystem011" );
+		s_pClient = (IBaseClientDLL *)TLP_Interface( "client", CLIENT_DLL_INTERFACE_VERSION );
+		s_pTrace = (IEngineTrace *)TLP_Interface( "engine", INTERFACEVERSION_ENGINETRACE_CLIENT );
+	}
+	return ok;
 }
 
 // the map as the engine found it (its search order: custom/, the game folder, VPKs, download/); only the lumps the
@@ -165,6 +157,242 @@ static TLMapFile *OpenGameMap( const char *level )
 }
 
 //-----------------------------------------------------------------------------
+// Solid-looking see-through materials: a map's material with "$translucent" whose texture has no see-through pixel
+// looks solid but is drawn like glass (it hides nothing in the depth buffer), and we draw after it - so the triggers
+// behind it would show. Found here from the VMT + VTF through the game's filesystem (the map's packed files too).
+//-----------------------------------------------------------------------------
+// per map: what the check may read at most (a map can name thousands of materials and huge textures)
+static long long s_nCheckBytes;
+static int s_nCheckMaterials;
+static const long long MAX_CHECK_BYTES = 128ll << 20;
+static const int MAX_CHECK_MATERIALS = 256;
+
+// part of a game file: len bytes at ofs (len -1 = all of it, up to maxBytes); counts against the budget
+static bool ReadGameFile( const std::string &path, std::vector<unsigned char> &out, unsigned int maxBytes, long long ofs = 0, long long len = -1,
+						  unsigned int *pSize = NULL )
+{
+	FileHandle_t h = s_pFileSystem ? s_pFileSystem->Open( path.c_str(), "rb", "GAME" ) : NULL;
+	if ( !h )
+		return false;
+	const unsigned int size = s_pFileSystem->Size( h );
+	if ( pSize )
+		*pSize = size;
+	if ( len < 0 )
+		len = (long long)size - ofs;
+	bool ok = size > 0 && ofs >= 0 && len > 0 && ofs + len <= size && len <= maxBytes && s_nCheckBytes + len <= MAX_CHECK_BYTES;
+	if ( ok )
+	{
+		s_nCheckBytes += len;
+		out.resize( (size_t)len );
+		s_pFileSystem->Seek( h, (int)ofs, FILESYSTEM_SEEK_HEAD );
+		ok = s_pFileSystem->Read( out.data(), (int)len, h ) == (int)len;
+	}
+	s_pFileSystem->Close( h );
+	return ok;
+}
+
+static std::string Lower( std::string t )
+{
+	for ( char &c : t )
+		c = (char)( c == '\\' ? '/' : tolower( (unsigned char)c ) );
+	return t;
+}
+
+// a VMT: its shader and the keys that decide how it's drawn (top level; a "patch" = its include + replace / insert)
+struct Vmt_t { std::string shader; std::map<std::string, std::string> kv; bool proxies = false; };
+static bool LoadVmt( const std::string &path, Vmt_t &out, int depth )
+{
+	std::vector<unsigned char> b;
+	if ( depth > 4 || !ReadGameFile( path, b, 1 << 20 ) )
+		return false;
+	struct Tok { std::string s; bool brace; };
+	std::vector<Tok> t;
+	for ( size_t i = 0, n = b.size(); i < n; )
+	{
+		const char c = (char)b[i];
+		if ( isspace( (unsigned char)c ) ) { i++; continue; }
+		if ( c == '/' && i + 1 < n && b[i + 1] == '/' ) { while ( i < n && b[i] != '\n' ) i++; continue; }
+		if ( c == '{' || c == '}' ) { t.push_back( { std::string( 1, c ), true } ); i++; continue; }
+		std::string w;
+		if ( c == '"' ) { i++; while ( i < n && b[i] != '"' ) w += (char)b[i++]; i++; }
+		else while ( i < n && !isspace( b[i] ) && b[i] != '{' && b[i] != '}' && b[i] != '"' ) w += (char)b[i++];
+		t.push_back( { w, false } );
+	}
+	if ( t.size() < 2 || t[0].brace || !t[1].brace || t[1].s != "{" )
+		return false;
+	out.shader = Lower( t[0].s );
+	std::string include, block;
+	std::map<std::string, std::string> patch;
+	int level = 1;
+	for ( size_t i = 2; i < t.size() && level > 0; i++ )
+	{
+		if ( t[i].brace )
+		{
+			level += t[i].s == "{" ? 1 : -1;
+			if ( level <= 1 )
+				block.clear();
+			continue;
+		}
+		const std::string key = Lower( t[i].s );
+		if ( i + 1 < t.size() && t[i + 1].brace && t[i + 1].s == "{" )
+		{
+			if ( level == 1 )
+				block = key;
+			if ( key == "proxies" )
+				out.proxies = true;
+			continue;		// (the brace opens the block next round)
+		}
+		if ( i + 1 >= t.size() )
+			break;
+		const std::string val = t[++i].s;
+		if ( level == 1 )
+		{
+			if ( out.shader == "patch" && key == "include" )
+				include = val;
+			else
+				out.kv[key] = val;
+		}
+		else if ( level == 2 && ( block == "replace" || block == "insert" ) )
+			patch[key] = val;
+	}
+	if ( out.shader == "patch" )
+	{
+		Vmt_t base;
+		if ( include.empty() || !LoadVmt( Lower( include ), base, depth + 1 ) )
+			return false;
+		for ( const auto &kv : patch )
+			base.kv[kv.first] = kv.second;
+		base.proxies |= out.proxies;		// (a patch can add proxies)
+		out = base;
+	}
+	return true;
+}
+
+// a VTF without one see-through pixel: a format without alpha, or alpha >= 250 everywhere in its biggest mip (read
+// alone: the header, the resource list, then those bytes). One frame, no cube map; anything unknown = see-through.
+static bool TextureLooksSolid( const std::string &name )
+{
+	const std::string path = "materials/" + Lower( name ) + ".vtf";
+	std::vector<unsigned char> v;
+	unsigned int fileSize = 0;
+	if ( !ReadGameFile( path, v, 4096, 0, 80, &fileSize ) || memcmp( v.data(), "VTF", 4 ) )
+		return false;
+	unsigned int ver[2], headerSize, flags;
+	unsigned short w, h, frames;
+	int fmt;
+	memcpy( ver, v.data() + 4, 8 );
+	memcpy( &headerSize, v.data() + 12, 4 );
+	memcpy( &w, v.data() + 16, 2 );
+	memcpy( &h, v.data() + 18, 2 );
+	memcpy( &flags, v.data() + 20, 4 );
+	memcpy( &frames, v.data() + 24, 2 );
+	memcpy( &fmt, v.data() + 52, 4 );
+	if ( ( flags & ( 0x1000 | 0x4000 ) ) || frames > 1 || !w || !h )
+		return false;		// one-bit alpha (cut-outs), cube map, animated
+	int bpb, blockW;		// bytes per block, block width (4 = DXT)
+	switch ( fmt )
+	{
+	case 13: case 2: case 3: case 4: case 16: case 17: case 5:	// DXT1, RGB888, BGR888, RGB565, BGRX8888, BGR565, I8
+		return true;		// no alpha at all
+	case 15: case 14: bpb = 16; blockW = 4; break;					// DXT5, DXT3
+	case 0: case 1: case 11: case 12: bpb = 4; blockW = 1; break;	// RGBA / ABGR / ARGB / BGRA 8888
+	default: return false;
+	}
+	const size_t bw = ( w + blockW - 1 ) / blockW, bh = ( h + blockW - 1 ) / blockW, big = bw * bh * bpb;
+	// the biggest mip ends the image data: the file's end (7.2), or the end of the image resource (7.3+)
+	size_t end = fileSize, imgOfs = headerSize;
+	if ( ver[0] == 7 && ver[1] >= 3 )
+	{
+		unsigned int nRes;
+		memcpy( &nRes, v.data() + 68, 4 );
+		nRes = MIN( nRes, 32u );
+		std::vector<unsigned char> res;
+		if ( !ReadGameFile( path, res, 4096, 80, 8 * nRes ) )
+			return false;
+		std::vector<size_t> ofs;
+		imgOfs = 0;
+		for ( unsigned int r = 0; r < nRes; r++ )
+		{
+			const unsigned char *e = res.data() + 8 * r;
+			unsigned int o;
+			memcpy( &o, e + 4, 4 );
+			if ( e[3] & 0x2 )
+				continue;		// (no data: the value is stored in place)
+			if ( e[0] == 0x30 && e[1] == 0 && e[2] == 0 )
+				imgOfs = o;
+			ofs.push_back( o );
+		}
+		if ( !imgOfs )
+			return false;
+		for ( size_t o : ofs )
+			if ( o > imgOfs && o < end )
+				end = o;
+	}
+	if ( end > fileSize || big > end || end - big < imgOfs || big > ( 64u << 20 ) )
+		return false;
+	std::vector<unsigned char> img;
+	if ( !ReadGameFile( path, img, 64u << 20, (long long)( end - big ), (long long)big ) )
+		return false;
+	const unsigned char *d = img.data();
+	int lowest = 255;
+	if ( fmt == 15 )
+		for ( size_t b = 0; b < big && lowest >= 250; b += 16 )
+		{
+			const int a0 = d[b], a1 = d[b + 1];
+			int pal[8] = { a0, a1 };
+			for ( int i = 0; i < 6; i++ )
+				pal[2 + i] = a0 > a1 ? ( ( 6 - i ) * a0 + ( i + 1 ) * a1 ) / 7 : i < 4 ? ( ( 4 - i ) * a0 + ( i + 1 ) * a1 ) / 5 : i == 4 ? 0 : 255;
+			unsigned long long bits = 0;
+			memcpy( &bits, d + b + 2, 6 );
+			for ( int p = 0; p < 16; p++ )
+				lowest = MIN( lowest, pal[( bits >> ( 3 * p ) ) & 7] );
+		}
+	else if ( fmt == 14 )
+		for ( size_t b = 0; b < big && lowest >= 250; b += 16 )
+			for ( int k = 0; k < 8; k++ )
+				lowest = MIN( lowest, MIN( d[b + k] & 15, d[b + k] >> 4 ) * 17 );
+	else
+	{
+		const int ai = fmt == 0 || fmt == 12 ? 3 : 0;		// RGBA, BGRA: alpha last; ABGR, ARGB: first
+		for ( size_t b = 0; b < big && lowest >= 250; b += 4 )
+			lowest = MIN( lowest, (int)d[b + ai] );
+	}
+	return lowest >= 250;
+}
+
+static std::map<std::string, bool> s_TextureSolidCache;
+static bool TextureLooksSolidCached( const std::string &name )
+{
+	const std::string key = Lower( name );
+	auto it = s_TextureSolidCache.find( key );
+	if ( it != s_TextureSolidCache.end() )
+		return it->second;
+	return s_TextureSolidCache[key] = TextureLooksSolid( key );
+}
+
+static std::map<std::string, bool> s_SolidLookingCache;
+static bool SolidLookingSeeThrough( const char *material )
+{
+	const std::string name = Lower( material );
+	auto it = s_SolidLookingCache.find( name );
+	if ( it != s_SolidLookingCache.end() )
+		return it->second;
+	bool yes = false;
+	Vmt_t m;
+	if ( ++s_nCheckMaterials <= MAX_CHECK_MATERIALS && LoadVmt( "materials/" + name + ".vmt", m, 0 ) && !m.proxies &&
+		 ( m.shader.find( "lightmappedgeneric" ) != std::string::npos || m.shader.find( "worldvertextransition" ) != std::string::npos ||
+		   m.shader.find( "unlitgeneric" ) != std::string::npos ) )
+	{
+		auto num = [&]( const char *k, float def ) { auto f = m.kv.find( k ); return f == m.kv.end() ? def : (float)atof( f->second.c_str() ); };
+		const std::string base = m.kv.count( "$basetexture" ) ? m.kv["$basetexture"] : "";
+		yes = num( "$translucent", 0 ) != 0 && num( "$additive", 0 ) == 0 && num( "$alpha", 1 ) >= 0.99f && !base.empty() &&
+			  TextureLooksSolidCached( base ) && ( !m.kv.count( "$basetexture2" ) || TextureLooksSolidCached( m.kv["$basetexture2"] ) );
+	}
+	s_SolidLookingCache[name] = yes;
+	return yes;
+}
+
+//-----------------------------------------------------------------------------
 // The map's triggers and their meshes
 //-----------------------------------------------------------------------------
 static CTLMap s_Map;
@@ -183,7 +411,6 @@ int TL_ModelType( int model ) { const TLModel_t *m = s_Map.Model( model ); retur
 static std::vector<int> s_CTOf;				// by model number: index into g_TLCT, -1 = none
 static std::vector<int> s_MapCTs, s_MapCTModels;	// this map's (g_TLCT order) and their models
 static int s_nCTListMatched = -1;
-static std::string s_CTMapMatched;
 
 // "maps/foo.bsp" -> "foo"
 static std::string MapName( const char *level )
@@ -205,13 +432,14 @@ static bool SameBox( const TLModel_t *m, const TLCustomTrigger_t &ct )
 	return true;
 }
 
+static char s_szCTLevel[260];
 static void MatchCTs()
 {
-	std::string map = MapName( s_Map.Level() );
-	if ( s_nCTListMatched == g_nTLCTListVersion && map == s_CTMapMatched && (int)s_CTOf.size() == s_Map.NumModels() )
+	if ( s_nCTListMatched == g_nTLCTListVersion && !strcmp( s_Map.Level(), s_szCTLevel ) && (int)s_CTOf.size() == s_Map.NumModels() )
 		return;
+	std::string map = MapName( s_Map.Level() );
 	s_nCTListMatched = g_nTLCTListVersion;
-	s_CTMapMatched = map;
+	TL_StrCopy( s_szCTLevel, s_Map.Level(), sizeof( s_szCTLevel ) );
 	s_CTOf.assign( s_Map.NumModels(), -1 );
 	s_MapCTs.clear();
 	s_MapCTModels.clear();
@@ -356,7 +584,6 @@ static float RayHit( const TLModel_t &m, const Vector &eye, const Vector &dir )
 static IMaterial *s_pDrawMaterial;		// materials/triggerlook/trigger.vmt: unlit, vertex colour + alpha, decal depth bias
 static double s_tFlush;					// (diagnosis) time in Flush this draw
 static double s_tStage[4];				// (diagnosis) last draw: collect, order, copy, flush (seconds)
-static Vector s_vecLastCam;
 static std::vector<TLVert_t> s_BatchVerts;
 static std::vector<unsigned short> s_BatchIndices;
 static int s_nMaxVerts, s_nMaxIndices;
@@ -408,8 +635,77 @@ static bool IsIdentity( const matrix3x4_t &m )
 	return true;
 }
 
+// the solid-looking see-through surfaces as static meshes (built once per map), drawn depth-only before the triggers
+static IMaterial *s_pDepthMaterial;		// materials/triggerlook/depth.vmt (DepthWrite: no colour)
+static std::vector<IMesh *> s_OccMeshes;
+static int s_nOccTris;
+
+static void DestroyOccluders()
+{
+	if ( s_OccMeshes.empty() || !s_pMatSys )
+		return;
+	CMatRenderContextPtr ctx( s_pMatSys );
+	for ( IMesh *m : s_OccMeshes )
+		ctx->DestroyStaticMesh( m );
+	s_OccMeshes.clear();
+	s_nOccTris = 0;
+}
+
+static void BuildOccluders()
+{
+	DestroyOccluders();
+	const int nPolys = (int)s_Map.m_OccFirst.size() - 1;
+	if ( nPolys <= 0 || !s_pDepthMaterial )
+		return;
+	CMatRenderContextPtr ctx( s_pMatSys );
+	const VertexFormat_t fmt = VERTEX_POSITION | VERTEX_TEXCOORD_SIZE( 0, 2 );
+	for ( int p0 = 0; p0 < nPolys; )
+	{
+		// as many polygons as fit one mesh (16-bit indices)
+		int nv = 0, ni = 0, p1 = p0;
+		for ( ; p1 < nPolys; p1++ )
+		{
+			const int c = s_Map.m_OccFirst[p1 + 1] - s_Map.m_OccFirst[p1];
+			if ( nv + c > 30000 )
+				break;
+			nv += c;
+			ni += 3 * ( c - 2 );
+		}
+		if ( p1 == p0 )
+			break;
+		IMesh *pMesh = ctx->CreateStaticMesh( fmt, TEXTURE_GROUP_STATIC_VERTEX_BUFFER_OTHER, s_pDepthMaterial );
+		if ( !pMesh )
+			break;
+		CMeshBuilder mb;
+		mb.Begin( pMesh, MATERIAL_TRIANGLES, nv, ni );
+		for ( int p = p0; p < p1; p++ )
+			for ( int k = s_Map.m_OccFirst[p]; k < s_Map.m_OccFirst[p + 1]; k++ )
+			{
+				mb.Position3fv( s_Map.m_OccVerts[k].Base() );
+				mb.TexCoord2f( 0, 0, 0 );
+				mb.AdvanceVertex();
+			}
+		int base = 0;
+		for ( int p = p0; p < p1; p++ )
+		{
+			const int c = s_Map.m_OccFirst[p + 1] - s_Map.m_OccFirst[p];
+			for ( int k = 1; k + 1 < c; k++ )
+			{
+				mb.FastIndex( base );
+				mb.FastIndex( base + k );
+				mb.FastIndex( base + k + 1 );
+			}
+			base += c;
+			s_nOccTris += c - 2;
+		}
+		mb.End();
+		s_OccMeshes.push_back( pMesh );
+		p0 = p1;
+	}
+}
+
 // where each model is drawn (once per map): the map's origin / angles keys (most triggers have none), its world box
-struct Place_t { matrix3x4_t xf; bool moved = false; Vector mins, maxs; std::vector<int> clusters; TLModel_t grown; };
+struct Place_t { matrix3x4_t xf; bool moved = false; Vector mins, maxs; std::vector<int> clusters; std::vector<Vector> grown; };
 static std::vector<Place_t> s_Place;
 
 static void PlaceModels()
@@ -429,7 +725,9 @@ static void PlaceModels()
 				p.maxs = m->maxs;
 			}
 			s_Map.BoxClusters( p.mins - Vector( 1, 1, 1 ), p.maxs + Vector( 1, 1, 1 ), p.clusters );
-			TL_ExpandModel( *m, TL_DRAW_GROW_X100 / 100.0f, p.grown );	// (what's drawn; picking + custom triggers use the map's own)
+			TLModel_t g;
+			TL_ExpandModel( *m, TL_DRAW_GROW_X100 / 100.0f, g );	// (what's drawn; picking + custom triggers use the map's own)
+			p.grown.swap( g.verts );
 		}
 }
 
@@ -437,7 +735,14 @@ static void PlaceModels()
 static void BuildPlacedMesh( int index, const TLModel_t &m, const TLLook_t &look, TLMesh_t &out )
 {
 	const Place_t &p = s_Place[index];
-	TL_BuildMesh( p.grown.polys.size() == m.polys.size() ? p.grown : m, look, out );
+	if ( p.grown.size() == m.verts.size() )
+	{
+		TLModel_t g = m;
+		g.verts = p.grown;
+		TL_BuildMesh( g, look, out );
+	}
+	else
+		TL_BuildMesh( m, look, out );
 	if ( p.moved )
 		for ( TLVert_t &v : out.verts )
 		{
@@ -630,7 +935,7 @@ static void OrderTriggers( const Vector &camera )
 }
 
 static bool s_bPVS = true;					// triggerlook_pvs
-static int s_nCamCluster = -1, s_nPVSCluster = -2, s_nPVSCulled, s_nPVSCulledCluster;
+static int s_nCamCluster = -1, s_nPVSCluster = -2, s_nPVSCulled;	// (culled: per cluster)
 static std::vector<unsigned char> s_PVS;	// the camera cluster's PVS row
 static std::vector<char> s_ModelSeen;		// by model: the camera cluster can see it (worked out once per cluster)
 static std::vector<int> s_SeenModels;		// ... the list of those
@@ -679,6 +984,13 @@ static void DrawTriggers( IMatRenderContext *ctx, const Vector &camera, const Ve
 		memcpy( &s_BuiltVP, &s_VP, sizeof( VMatrix ) );
 	}
 	const double t3 = Plat_FloatTime();
+	if ( !s_OccMeshes.empty() && s_nDrawnSides > 0 )
+	{
+		ctx->Bind( s_pDepthMaterial );
+		for ( IMesh *m : s_OccMeshes )
+			m->Draw();
+		ctx->Bind( s_pDrawMaterial );
+	}
 	SubmitChunks( ctx );
 	s_tStage[3] = s_tFlush;
 	if ( !s_nReused )
@@ -691,7 +1003,7 @@ static void DrawTriggers( IMatRenderContext *ctx, const Vector &camera, const Ve
 static void BuildChunks( IMatRenderContext *ctx, const Vector &camera, const Vector &fwd )
 {
 	memset( s_nShown, 0, sizeof( s_nShown ) );
-	s_nDrawn = s_nDrawnSides = s_nPVSCulled = 0;
+	s_nDrawn = s_nDrawnSides = 0;
 	const bool picking = s_bPicking;
 	float pickDist = picking ? WorldDist( camera, fwd ) : 0;
 	s_flPickWorld = pickDist;
@@ -722,9 +1034,9 @@ static void BuildChunks( IMatRenderContext *ctx, const Vector &camera, const Vec
 			if ( seen )
 				s_SeenModels.push_back( mi );
 		}
-		s_nPVSCulledCluster = 0;
+		s_nPVSCulled = 0;
 		for ( int mi = 1; mi < s_Map.NumModels(); mi++ )
-			s_nPVSCulledCluster += s_Map.Model( mi ) && !s_ModelSeen[mi];
+			s_nPVSCulled += s_Map.Model( mi ) && !s_ModelSeen[mi];
 	}
 
 	// one trigger of the map (model *index): culled, picked, drawn in its look
@@ -778,10 +1090,8 @@ static void BuildChunks( IMatRenderContext *ctx, const Vector &camera, const Vec
 		s_DrawTrigs.push_back( { pMesh, m, eye, pl.mins, pl.maxs, ( ( pl.mins + pl.maxs ) * 0.5f - camera ).LengthSqr() } );
 	};
 	const double t0 = Plat_FloatTime();
-	s_vecLastCam = camera;
 	for ( int mi : s_SeenModels )
 		add( mi, s_Map.Model( mi ) );
-	s_nPVSCulled = s_nPVSCulledCluster;
 	const double t1 = Plat_FloatTime();
 	OrderTriggers( camera );
 	const double t2 = Plat_FloatTime();
@@ -820,19 +1130,25 @@ static void BuildChunks( IMatRenderContext *ctx, const Vector &camera, const Vec
 	s_nPickHover = pickModel;
 }
 
-// every model's mesh in its look now (map load), so none is built mid-game the first time it comes into view
+// every model's mesh in its current look (map load, menu closed after edits), so none is built mid-game the first
+// time it comes into view
 static void PrebuildMeshes()
 {
+	if ( (int)s_Meshes.size() != s_Map.NumModels() || (int)s_Place.size() != s_Map.NumModels() )
+		return;
 	MatchCTs();
 	for ( int mi = 1; mi < s_Map.NumModels(); mi++ )
 		if ( const TLModel_t *m = s_Map.Model( mi ) )
 		{
 			const int ct = mi < (int)s_CTOf.size() ? s_CTOf[mi] : -1;
-			const TLLook_t &look = ct >= 0 ? g_TLCT[ct].look : g_TLLook[m->type];
-			BuildPlacedMesh( mi, *m, look, s_Meshes[mi] );
-			s_Meshes[mi].version = ct >= 0 ? g_TLCT[ct].version : g_nTLTypeVersion[m->type];
+			const int version = ct >= 0 ? g_TLCT[ct].version : g_nTLTypeVersion[m->type];
+			if ( s_Meshes[mi].version == version )
+				continue;
+			BuildPlacedMesh( mi, *m, ct >= 0 ? g_TLCT[ct].look : g_TLLook[m->type], s_Meshes[mi] );
+			s_Meshes[mi].version = version;
 		}
 }
+void TL_PrebuildMeshes() { PrebuildMeshes(); }
 
 //-----------------------------------------------------------------------------
 // The game's own trigger material draws nothing while we draw (and again when triggerlook_enable is 0).
@@ -927,13 +1243,15 @@ public:
 		CMatRenderContextPtr pRenderContext( s_pMatSys );
 		VMatrix view;
 		pRenderContext->GetMatrix( MATERIAL_VIEW, &view );
-		m_vecCamera = TL_ViewOrigin( view );
+		const Vector camera = TL_ViewOrigin( view );
 		// only in the player's own view: not the 3D skybox's (its camera sits in the sky room, the triggers would show
-		// through the sky), water reflections or monitors - those cameras are elsewhere
+		// through the sky), water reflections or monitors - those cameras are elsewhere (and mustn't become our sort
+		// position: the next view sorts by it)
 		CViewSetup player;
 		const bool havePlayer = s_pClient && s_pClient->GetPlayerView( player );
-		if ( havePlayer && player.origin.DistToSqr( m_vecCamera ) > 1.0f )
+		if ( havePlayer && player.origin.DistToSqr( camera ) > 1.0f )
 			return 1;
+		m_vecCamera = camera;
 		// where the crosshair points (SELECT TRIGGER)
 		QAngle ang = player.angles;
 		if ( !havePlayer )
@@ -960,7 +1278,17 @@ public:
 			return false;
 		}
 		const char *level = s_pEngine->GetLevelName();
-		if ( RenderHandle() != INVALID_CLIENT_RENDER_HANDLE && !m_bLeftGame && !strcmp( level, m_szLevel ) )
+		const bool sameSession = !m_bLeftGame && !strcmp( level, m_szLevel );
+		// in the leaf system only while drawing: every view walks a registered renderable in every visible leaf
+		const bool want = s_bEnable && g_bTLShow && s_pDrawMaterial;
+		if ( sameSession && !want && RenderHandle() != INVALID_CLIENT_RENDER_HANDLE )
+		{
+			s_pLeafSystem->RemoveRenderable( RenderHandle() );
+			RenderHandle() = INVALID_CLIENT_RENDER_HANDLE;
+		}
+		if ( !s_bEnable )
+			return false;		// (off entirely: the map isn't even read)
+		if ( sameSession && ( !want || RenderHandle() != INVALID_CLIENT_RENDER_HANDLE ) )
 			return true;
 		if ( !s_pDrawMaterial )
 		{
@@ -976,15 +1304,32 @@ public:
 		}
 		if ( strcmp( level, s_Map.Level() ) )
 		{
-			if ( !s_Map.Load( s_pEngine->GetGameDirectory(), level, OpenGameMap ) )
+			if ( !s_pDepthMaterial )
+			{
+				IMaterial *pMat = s_pMatSys->FindMaterial( "triggerlook/depth", TEXTURE_GROUP_OTHER, false );
+				if ( pMat && !pMat->IsErrorMaterial() )
+				{
+					pMat->IncrementReferenceCount();
+					s_pDepthMaterial = pMat;
+				}
+			}
+			s_SolidLookingCache.clear();
+			s_TextureSolidCache.clear();
+			s_nCheckBytes = 0;
+			s_nCheckMaterials = 0;
+			if ( !s_Map.Load( s_pEngine->GetGameDirectory(), level, OpenGameMap, s_pDepthMaterial ? SolidLookingSeeThrough : NULL ) )
 				s_Map.Clear();
+			BuildOccluders();
 			s_Meshes.assign( s_Map.NumModels(), TLMesh_t() );
 			PlaceModels();
 			PrebuildMeshes();
 			s_nPVSCluster = -2;		// (the visible list belongs to the old map)
+			s_nHLModel = -1;		// (so does the highlight mesh)
 		}
-		RenderHandle() = INVALID_CLIENT_RENDER_HANDLE;	// stale after a level change
-		s_pLeafSystem->AddRenderable( this, RENDER_GROUP_TRANSLUCENT_ENTITY );
+		if ( !sameSession )
+			RenderHandle() = INVALID_CLIENT_RENDER_HANDLE;	// stale after a level change
+		if ( s_bEnable && g_bTLShow && s_pDrawMaterial && RenderHandle() == INVALID_CLIENT_RENDER_HANDLE )
+			s_pLeafSystem->AddRenderable( this, RENDER_GROUP_TRANSLUCENT_ENTITY );
 		TL_StrCopy( m_szLevel, level, sizeof( m_szLevel ) );
 		m_bLeftGame = false;
 		return true;
@@ -992,7 +1337,6 @@ public:
 
 	void LeftGame() { m_bLeftGame = true; }
 	bool InGame() const { return !m_bLeftGame; }
-	const char *Level() const { return m_szLevel; }
 
 private:
 	matrix3x4_t m_Identity;
@@ -1104,15 +1448,16 @@ static void InstallGameFiles( const char *gameDir )
 // on the main thread: our game files, our commands, the callback, and the panels if VGUI is up already
 static void MainThreadInit()
 {
-	if ( ConnectInterfaces() || s_pEngine )
-		InstallGameFiles( s_pEngine->GetGameDirectory() );
 	ICvar *pCvar = (ICvar *)TLP_Interface( "vstdlib", CVAR_INTERFACE_VERSION );
 	if ( pCvar && pCvar->FindCommandBase( "triggerlook_menu" ) )
 	{
-		// two loaders (its own preload and bhoptools, or two folders on Windows): the first copy does it all
+		// two loaders (its own preload and bhoptools, or two folders on Windows): the first copy does it all, also its
+		// game files (a second, other version mustn't swap them)
 		Warning( "triggerlook: already loaded, this copy stays off\n" );
 		return;
 	}
+	if ( ConnectInterfaces() || s_pEngine )
+		InstallGameFiles( s_pEngine->GetGameDirectory() );
 	if ( !TL_RegisterCommands( pCvar ) )
 	{
 		Warning( "triggerlook: no VEngineCvar004, not started\n" );
@@ -1134,64 +1479,6 @@ CON_COMMAND( triggerlook_menu, "triggerlook: open / close the trigger menu (bind
 		return;
 	}
 	TLUI_SetOpen( !TLUI_IsOpen() );
-}
-
-// what the server sends: every entity with a brush model (diagnosis: a show-triggers plugin that sends them its own way)
-CON_COMMAND( triggerlook_ents, "triggerlook: list the entities with brush models the client has (to the info file)" )
-{
-	if ( !ConnectInterfaces() )
-		return;
-	std::string out = "triggerlook_ents:\n";
-	char line[512];
-	int hi = MIN( s_pEntList->GetHighestEntityIndex(), 16383 ), n = 0, n2 = 0;
-	std::string other;
-	for ( int i = 1; i <= hi; i++ )
-	{
-		IClientEntity *e = s_pEntList->GetClientEntity( i );
-		IClientRenderable *r = e ? e->GetClientRenderable() : NULL;
-		const model_t *mdl = r ? r->GetModel() : NULL;
-		const char *name = mdl ? s_pModelInfo->GetModelName( mdl ) : NULL;
-		IClientNetworkable *net = e ? e->GetClientNetworkable() : NULL;
-		ClientClass *cc = net ? net->GetClientClass() : NULL;
-		if ( !name || name[0] != '*' )
-		{
-			// everything else too, in short (what a plugin might draw triggers with)
-			if ( e && n2++ < 300 )
-			{
-				const Vector o = r ? r->GetRenderOrigin() : Vector( 0, 0, 0 );
-				snprintf( line, sizeof( line ), "  #%d %s %s dormant %d drawn %d at %.0f %.0f %.0f\n", i, cc && cc->m_pNetworkName ? cc->m_pNetworkName : "?",
-							name ? name : mdl ? "(unnamed)" : "-", net && net->IsDormant() ? 1 : 0, r && r->ShouldDraw() ? 1 : 0, o.x, o.y, o.z );
-				other += line;
-			}
-			continue;
-		}
-		const TLModel_t *m = s_Map.Model( atoi( name + 1 ) );
-		snprintf( line, sizeof( line ), "  #%d %s %s: map %s, dormant %d, drawn %d\n", i, cc && cc->m_pNetworkName ? cc->m_pNetworkName : "?", name,
-					m ? m->classname.c_str() : "not a trigger", net && net->IsDormant() ? 1 : 0, r->ShouldDraw() ? 1 : 0 );
-		if ( n++ < 200 )
-			out += line;
-	}
-	snprintf( line, sizeof( line ), "  %d brush entities; others:\n", n );
-	out += line + other;
-	// the precached models a show-brushes plugin uses
-	for ( int mi = 0; mi < 8192; mi++ )
-	{
-		const model_t *pm = s_pModelInfo->GetModel( mi );
-		const char *mn = pm ? s_pModelInfo->GetModelName( pm ) : NULL;
-		if ( mn && TL_StrIStr( mn, "showbrushes" ) )
-		{
-			snprintf( line, sizeof( line ), "  model %d: %s\n", mi, mn );
-			out += line;
-		}
-	}
-	Msg( "%s", out.c_str() );
-	char path[1024];
-	snprintf( path, sizeof( path ), "%s/info.txt", TLP_CacheDir() );
-	if ( FILE *f = fopen( path, "a" ) )
-	{
-		fputs( out.c_str(), f );
-		fclose( f );
-	}
 }
 
 // triggerlook_set <type|all> [show 0/1] [fill r g b a] [border r g b a] [width n]  (scripts, tests)
@@ -1256,8 +1543,13 @@ CON_COMMAND( triggerlook_info, "triggerlook: show what it's doing" )
 	snprintf( line, sizeof( line ), "  last frame: %d triggers drawn, %d sides, %d pairs ordered, %d left out by the map's visibility (camera cluster %d), %d view(s) reusing the first\n",
 				s_nDrawn, s_nDrawnSides, s_nOrderPairs, s_nPVSCulled, s_nCamCluster, s_nReusedLast );
 	out += line;
+	snprintf( line, sizeof( line ), "  solid-looking see-through surfaces hiding triggers: %d (%d triangles in %d meshes)%s%s; depth material %s\n",
+				s_Map.m_OccFirst.empty() ? 0 : (int)s_Map.m_OccFirst.size() - 1, s_nOccTris, (int)s_OccMeshes.size(),
+				s_Map.m_OccMaterials.empty() ? "" : ", first: ", s_Map.m_OccMaterials.empty() ? "" : s_Map.m_OccMaterials[0].c_str(),
+				s_pDepthMaterial ? "OK" : "MISSING" );
+	out += line;
 	snprintf( line, sizeof( line ), "  last draw stages: collect %.1f, order %.1f, copy %.1f, flush %.1f us; camera %.0f %.0f %.0f\n",
-				s_tStage[0] * 1e6, s_tStage[1] * 1e6, s_tStage[2] * 1e6, s_tStage[3] * 1e6, s_vecLastCam.x, s_vecLastCam.y, s_vecLastCam.z );
+				s_tStage[0] * 1e6, s_tStage[1] * 1e6, s_tStage[2] * 1e6, s_tStage[3] * 1e6, s_vecBuiltCam.x, s_vecBuiltCam.y, s_vecBuiltCam.z );
 	out += line;
 	snprintf( line, sizeof( line ), "  draw cost: %.1f us average, %.1f us worst per draw (last %.1f s: %d draws, %d of them reusing, %d frames = %.0f fps)\n",
 				s_LastCost.avg * 1e6, s_LastCost.max * 1e6, s_LastCost.secs, s_LastCost.draws, s_LastCost.reused, s_LastCost.frames,

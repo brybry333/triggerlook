@@ -161,7 +161,8 @@ static BOOL has_insecure(const wchar_t *cmd)   // the engine matches its flags w
     for (const wchar_t *p = cmd; *p; p++) {
         if (_wcsnicmp(p, L"-insecure", 9)) continue;
         wchar_t before = p == cmd ? L' ' : p[-1], after = p[9];
-        if ((before == L' ' || before == L'\t' || before == L'"') && (after == 0 || after == L' ' || after == L'\t' || after == L'"')) return TRUE;
+        // (not next to a quote: inside quotes it's part of another argument, the game stays secured)
+        if ((before == L' ' || before == L'\t') && (after == 0 || after == L' ' || after == L'\t')) return TRUE;
     }
     return FALSE;
 }

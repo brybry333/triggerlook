@@ -55,13 +55,30 @@ static void logmsg(const char *fmt, ...)
     fputc('\n', g_log);
 }
 
+/* -insecure is one of the game's own arguments (not text inside another one): a VAC-secured game gets nothing mapped */
+static int game_is_insecure(void)
+{
+    char buf[65536];
+    FILE *f = fopen("/proc/self/cmdline", "rb");
+    if (!f) return 0;
+    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+    fclose(f);
+    buf[n] = 0;
+    for (size_t i = 0; i < n; i += strlen(buf + i) + 1)
+        if (!strcasecmp(buf + i, "-insecure")) return 1;
+    return 0;
+}
+
 static void load_mod(void)
 {
     g_done = 1;
+    if (!game_is_insecure()) { logmsg("the game wasn't started with -insecure: not loading %s", MOD_LIB); return; }
     if (dlsym(RTLD_DEFAULT, "TriggerLook_Init")) { logmsg("already loaded (bhoptools?), leaving it"); return; }
     Dl_info me;
     char path[4096];
     if (!dladdr((void *)load_mod, &me) || !me.dli_fname) { logmsg("dladdr failed - giving up"); return; }
+    /* a relative LD_PRELOAD path would load triggerlook.so from the game's folder (cstrike.sh changes into it) */
+    if (me.dli_fname[0] != '/') { logmsg("%s isn't a full path - put the full path in LD_PRELOAD", me.dli_fname); return; }
     snprintf(path, sizeof(path), "%s", me.dli_fname);
     char *slash = strrchr(path, '/');
     snprintf(slash ? slash + 1 : path, sizeof(path) - (slash ? (size_t)(slash + 1 - path) : 0), "%s", MOD_LIB);
