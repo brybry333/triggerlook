@@ -4,7 +4,8 @@
 // Every brush entity whose class starts with "trigger_" gets its shape rebuilt from its brushes (each brush =
 // the convex solid inside its side planes), so each side is one polygon with its real edges - the drawn faces
 // of the map are cut into pieces by the compiler, which would draw borders across the middle of a side.
-// Each trigger also gets a type (TLType_t) from its class and outputs.
+// Each trigger also gets a type (TLType_t) from its class and outputs. Player clip brushes of the world are read the
+// same way, one "model" each (TL_CLIP, numbered after the map's own brush models).
 //=============================================================================
 #ifndef TL_MAP_H
 #define TL_MAP_H
@@ -21,6 +22,7 @@ enum TLType_t
 	TL_PUSH,		// trigger_push
 	TL_GRAVITY,		// trigger_gravity, or a gravity output
 	TL_OTHER,		// every other trigger
+	TL_CLIP,		// a player clip brush of the world (not an entity)
 	TL_TYPES
 };
 extern const char *const g_TLTypeName[TL_TYPES];	// "teleport", ... (settings file, console)
@@ -34,12 +36,14 @@ struct TLPoly_t
 {
 	int		first, count;	// into TLModel_t::verts
 	Vector	normal;			// outward
+	int		brush = 0;		// which of the model's brushes it came from
 };
 
 struct TLModel_t
 {
 	int		type = -1;		// TLType_t, -1 = not a trigger
 	std::string classname;
+	Vector	origin, angles;	// where the map places it (its entity's keys; drawing without the entity uses them)
 	Vector	mins, maxs;		// model space (the entity's own; most triggers are never moved, so = world)
 	std::vector<Vector> verts;
 	std::vector<TLPoly_t> polys;
@@ -76,8 +80,23 @@ public:
 	int		m_nTriggers[TL_TYPES] = {};	// trigger models per type
 	int		m_nPolys = 0;
 
+	// Visibility (the map's PVS, what the server uses to decide what to send): the clusters a world box touches, the
+	// cluster a point is in (-1 = solid / outside / no vis data), and that cluster's PVS row (bit per cluster)
+	void BoxClusters( const Vector &mins, const Vector &maxs, std::vector<int> &out ) const;
+	int PointCluster( const Vector &p ) const;
+	bool ClusterPVS( int cluster, std::vector<unsigned char> &bits ) const;
+	bool HasVis() const { return m_nClusters > 0; }
+
 private:
-	std::vector<TLModel_t> m_Models;	// by brush model number (*N); 0 = the world, never a trigger
+	struct Plane_t { Vector n; float d; };
+	struct Node_t { int plane, child[2]; };
+	std::vector<Plane_t> m_Planes;
+	std::vector<Node_t> m_Nodes;
+	std::vector<short> m_LeafCluster;
+	std::vector<unsigned char> m_Vis;	// the visibility lump as is
+	int		m_nClusters = 0, m_nWorldHead = 0;
+
+	std::vector<TLModel_t> m_Models;	// by brush model number (*N); 0 = the world, never a trigger; then the clips
 	char	m_szLevel[260];
 };
 

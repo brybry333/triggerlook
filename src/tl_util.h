@@ -68,6 +68,18 @@ inline void TL_ITransform( const Vector &in, const matrix3x4_t &m, Vector &out )
 	out.z = d.x * m[0][2] + d.y * m[1][2] + d.z * m[2][2];
 }
 
+// an entity's placement from its angles (pitch yaw roll, degrees) and origin, like the engine's AngleMatrix
+inline void TL_AngleMatrix( const Vector &angles, const Vector &origin, matrix3x4_t &m )
+{
+	const float d = 3.14159265358979f / 180.0f;
+	float sp = sinf( angles.x * d ), cp = cosf( angles.x * d ), sy = sinf( angles.y * d ), cy = cosf( angles.y * d ),
+		  sr = sinf( angles.z * d ), cr = cosf( angles.z * d );
+	m[0][0] = cp * cy; m[1][0] = cp * sy; m[2][0] = -sp;
+	m[0][1] = sr * sp * cy - cr * sy; m[1][1] = sr * sp * sy + cr * cy; m[2][1] = sr * cp;
+	m[0][2] = cr * sp * cy + sr * sy; m[1][2] = cr * sp * sy - sr * cy; m[2][2] = cr * cp;
+	m[0][3] = origin.x; m[1][3] = origin.y; m[2][3] = origin.z;
+}
+
 // the world box of a box in an entity's space
 inline void TL_TransformAABB( const matrix3x4_t &m, const Vector &mins, const Vector &maxs, Vector &omins, Vector &omaxs )
 {

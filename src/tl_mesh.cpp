@@ -4,6 +4,8 @@
 #include <float.h>
 #include <math.h>
 
+#include <algorithm>
+
 #include "tl_mesh.h"
 #include "tl_util.h"
 
@@ -153,5 +155,120 @@ void TL_BuildMesh( const TLModel_t &m, const TLLook_t &look, TLMesh_t &out )
 		side.numVerts = (int)out.verts.size() - side.firstVert;
 		side.numIndices = (int)out.indices.size() - side.firstIndex;
 		out.sides.push_back( side );
+	}
+}
+
+// every corner of every brush once (a brush's sides share corners as separate copies; corners of two touching brushes
+// are kept apart): the normals of the sides through it decide where it moves. Three or more: least squares of
+// n . v = eps (exact for three, the usual brush corner); two: exact; one: along it. Not exact: see below.
+void TL_ExpandModel( const TLModel_t &in, float eps, TLModel_t &out )
+{
+	out = in;
+	const int nv = (int)in.verts.size();
+	std::vector<int> polyOf( nv, -1 );
+	for ( int pi = 0; pi < (int)in.polys.size(); pi++ )
+		for ( int k = 0; k < in.polys[pi].count; k++ )
+			if ( in.polys[pi].first + k < nv )
+				polyOf[in.polys[pi].first + k] = pi;
+	struct Key_t { long long x, y, z; int brush, v; };
+	std::vector<Key_t> keys( nv );
+	for ( int i = 0; i < nv; i++ )
+	{
+		const Vector &p = in.verts[i];
+		keys[i] = { llroundf( p.x * 16 ), llroundf( p.y * 16 ), llroundf( p.z * 16 ), polyOf[i] >= 0 ? in.polys[polyOf[i]].brush : -1, i };
+	}
+	auto same = []( const Key_t &a, const Key_t &b ) { return a.brush == b.brush && a.x == b.x && a.y == b.y && a.z == b.z; };
+	std::sort( keys.begin(), keys.end(), []( const Key_t &a, const Key_t &b ) {
+		return a.brush != b.brush ? a.brush < b.brush : a.x != b.x ? a.x < b.x : a.y != b.y ? a.y < b.y : a.z < b.z; } );
+	std::vector<Vector> normals;
+	for ( int a = 0; a < nv; )
+	{
+		int b = a + 1;
+		while ( b < nv && same( keys[b], keys[a] ) )
+			b++;
+		normals.clear();
+		for ( int k = a; k < b; k++ )
+		{
+			const int pi = polyOf[keys[k].v];
+			if ( pi < 0 )
+				continue;
+			const Vector &n = in.polys[pi].normal;
+			bool have = false;
+			for ( const Vector &m : normals )
+				have = have || DotProduct( m, n ) > 0.9999f;
+			if ( !have )
+				normals.push_back( n );
+		}
+		Vector v( 0, 0, 0 );
+		bool solved = false;
+		if ( normals.size() >= 3 )
+		{
+			// least squares: (sum n n^T) v = eps * sum n
+			double A[3][3] = {}, r[3] = {};
+			for ( const Vector &n : normals )
+				for ( int i = 0; i < 3; i++ )
+				{
+					r[i] += eps * n[i];
+					for ( int j = 0; j < 3; j++ )
+						A[i][j] += n[i] * n[j];
+				}
+			const double det = A[0][0] * ( A[1][1] * A[2][2] - A[1][2] * A[2][1] ) - A[0][1] * ( A[1][0] * A[2][2] - A[1][2] * A[2][0] ) +
+							   A[0][2] * ( A[1][0] * A[2][1] - A[1][1] * A[2][0] );
+			if ( fabs( det ) > 1e-3 )
+			{
+				for ( int c = 0; c < 3; c++ )
+				{
+					double M[3][3];
+					memcpy( M, A, sizeof( M ) );
+					for ( int i = 0; i < 3; i++ )
+						M[i][c] = r[i];
+					const double dc = M[0][0] * ( M[1][1] * M[2][2] - M[1][2] * M[2][1] ) - M[0][1] * ( M[1][0] * M[2][2] - M[1][2] * M[2][0] ) +
+									  M[0][2] * ( M[1][0] * M[2][1] - M[1][1] * M[2][0] );
+					v[c] = (float)( dc / det );
+				}
+				solved = true;
+			}
+		}
+		if ( !solved && normals.size() >= 2 )
+		{
+			// the two most different ones: v = k (n1 + n2), k = eps / (1 + n1 . n2)
+			int i1 = 0, i2 = 1;
+			float lo = DotProduct( normals[0], normals[1] );
+			for ( int i = 0; i < (int)normals.size(); i++ )
+				for ( int j = i + 1; j < (int)normals.size(); j++ )
+					if ( DotProduct( normals[i], normals[j] ) < lo )
+					{
+						lo = DotProduct( normals[i], normals[j] );
+						i1 = i;
+						i2 = j;
+					}
+			if ( lo > -0.999f )
+			{
+				v = ( normals[i1] + normals[i2] ) * ( eps / ( 1 + lo ) );
+				solved = true;
+			}
+		}
+		if ( !solved && normals.size() == 1 )
+		{
+			v = normals[0] * eps;
+			solved = true;
+		}
+		// exact = every side through the corner moves out by eps with it, and it doesn't spike out (sharp corners).
+		// Otherwise each side's copy of the corner moves along that side's own normal: every side still exactly eps
+		// out and flat, only a tiny seam at that corner.
+		bool exact = solved && v.LengthSqr() <= 16 * eps * eps;
+		for ( size_t i = 0; i < normals.size() && exact; i++ )
+			exact = fabsf( DotProduct( normals[i], v ) - eps ) < 0.02f * eps;
+		for ( int k = a; k < b; k++ )
+		{
+			const int vi = keys[k].v, pi = polyOf[vi];
+			out.verts[vi] = in.verts[vi] + ( exact || pi < 0 ? v : in.polys[pi].normal * eps );
+		}
+		a = b;
+	}
+	for ( int i = 0; i < 3; i++ )
+	{
+		out.mins[i] = in.mins[i] - eps;
+		out.maxs[i] = in.maxs[i] + eps;
 	}
 }

@@ -30,4 +30,9 @@ struct TLMesh_t
 
 void TL_BuildMesh( const TLModel_t &m, const TLLook_t &look, TLMesh_t &out );
 
+// The model grown by eps on every side (each corner moved so every side through it moves out by eps): what's drawn,
+// so a side lying on a floor shows in front of it without a depth bias, and nothing opens up along the edges
+enum { TL_DRAW_GROW_X100 = 50 };	// 0.5 units
+void TL_ExpandModel( const TLModel_t &in, float eps, TLModel_t &out );
+
 #endif // TL_MESH_H

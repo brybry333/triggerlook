@@ -15,8 +15,8 @@ extern "C" {
 #include "../utils/lzma/C/LzmaDec.h"
 }
 
-const char *const g_TLTypeName[TL_TYPES] = { "teleport", "booster", "push", "gravity", "other" };
-const char *const g_TLTypeLabel[TL_TYPES] = { "TELEPORT", "BOOSTER", "PUSH", "GRAVITY", "OTHER" };
+const char *const g_TLTypeName[TL_TYPES] = { "teleport", "booster", "push", "gravity", "other", "clip" };
+const char *const g_TLTypeLabel[TL_TYPES] = { "TELEPORT", "BOOSTER", "PUSH", "GRAVITY", "OTHER", "CLIPS" };
 
 int TL_Classify( const char *classname, const char *outputs )
 {
@@ -37,7 +37,7 @@ int TL_Classify( const char *classname, const char *outputs )
 
 namespace
 {
-	enum { LUMP_ENTITIES = 0, LUMP_PLANES = 1, LUMP_NODES = 5, LUMP_LEAFS = 10, LUMP_MODELS = 14, LUMP_LEAFBRUSHES = 17,
+	enum { LUMP_ENTITIES = 0, LUMP_PLANES = 1, LUMP_VISIBILITY = 4, LUMP_NODES = 5, LUMP_LEAFS = 10, LUMP_MODELS = 14, LUMP_LEAFBRUSHES = 17,
 		   LUMP_BRUSHES = 18, LUMP_BRUSHSIDES = 19, NUM_LUMPS = 64 };
 
 	#pragma pack(push, 1)
@@ -53,6 +53,7 @@ namespace
 	// limits against broken or hostile maps (maps come from servers): no lump this reader needs is anywhere near these
 	const long long MAX_LUMP = 256ll * 1024 * 1024, MAX_UNPACKED = 64u * 1024 * 1024;
 	const int MAX_BRUSH_SIDES = 128;		// vbsp's own limit
+	const int CONTENTS_PLAYERCLIP = 0x10000;	// tools/toolsclip, tools/toolsplayerclip
 	const long long MAX_CHOPS = 2000000;	// polygon clips per map (bhop_exodus needs ~40k)
 
 	// a lump running a little past the end of the file (seen: an entity lump 1 byte too long, the game loads the
@@ -138,7 +139,7 @@ namespace
 	}
 
 	// the entity lump: brush entities (model "*N") -> classname + every output value
-	struct Ent_t { std::string classname, outputs; };
+	struct Ent_t { std::string classname, outputs; Vector origin = Vector( 0, 0, 0 ), angles = Vector( 0, 0, 0 ); };
 	void ParseEntities( const char *text, int len, std::vector<Ent_t> &models )
 	{
 		const char *p = text, *end = text + len;
@@ -169,6 +170,12 @@ namespace
 				if ( !TL_StrICmp( key, "classname" ) ) e.classname = value;
 				else if ( !TL_StrICmp( key, "model" ) && value[0] == '*' ) model = atoi( value + 1 );
 				else if ( !TL_StrNICmp( key, "On", 2 ) ) { e.outputs += value; e.outputs += '\n'; }
+				else if ( !TL_StrICmp( key, "origin" ) || !TL_StrICmp( key, "angles" ) )
+				{
+					float v[3] = { 0, 0, 0 };
+					if ( sscanf( value, "%f %f %f", &v[0], &v[1], &v[2] ) == 3 && v[0] == v[0] && v[1] == v[1] && v[2] == v[2] )
+						( key[0] == 'o' || key[0] == 'O' ? e.origin : e.angles ).Init( v[0], v[1], v[2] );
+				}
 			}
 			if ( model > 0 && model < 65536 )
 			{
@@ -250,7 +257,7 @@ namespace
 	}
 
 	void AddBrush( const dbrush_t &b, const dbrushside_t *pSides, int nSides, const dplane_t *pPlanes, int nPlanes, TLModel_t &m,
-				   long long &chops )
+				   long long &chops, int brushId )
 	{
 		if ( b.firstside < 0 || b.numsides <= 0 || b.numsides > MAX_BRUSH_SIDES || b.firstside > nSides - b.numsides )
 			return;
@@ -300,6 +307,7 @@ namespace
 			poly.first = (int)m.verts.size();
 			poly.count = (int)clean.size();
 			poly.normal = pl.normal;
+			poly.brush = brushId;
 			for ( const DV &p : clean )
 			{
 				Vector v( Snap( p.x ), Snap( p.y ), Snap( p.z ) );
@@ -315,6 +323,11 @@ namespace
 void CTLMap::Clear()
 {
 	m_Models.clear();
+	m_Planes.clear();
+	m_Nodes.clear();
+	m_LeafCluster.clear();
+	m_Vis.clear();
+	m_nClusters = m_nWorldHead = 0;
 	memset( m_nTriggers, 0, sizeof( m_nTriggers ) );
 	m_nPolys = 0;
 	m_szLevel[0] = 0;
@@ -343,11 +356,13 @@ bool CTLMap::Load( const char *pszGameDir, const char *pszLevel, TLOpenMapFn pfn
 		Warning( "triggerlook: %s is not a supported BSP (version %d)\n", path, ok ? h.version : -1 );
 		return false;
 	}
-	std::vector<unsigned char> ents, planes, nodes, leafs, models, leafbrushes, brushes, brushsides;
+	std::vector<unsigned char> ents, planes, nodes, leafs, models, leafbrushes, brushes, brushsides, vis;
 	ok = ReadLump( *file, size, h, LUMP_ENTITIES, ents ) && ReadLump( *file, size, h, LUMP_PLANES, planes ) &&
 		 ReadLump( *file, size, h, LUMP_NODES, nodes ) && ReadLump( *file, size, h, LUMP_LEAFS, leafs ) &&
 		 ReadLump( *file, size, h, LUMP_MODELS, models ) && ReadLump( *file, size, h, LUMP_LEAFBRUSHES, leafbrushes ) &&
 		 ReadLump( *file, size, h, LUMP_BRUSHES, brushes ) && ReadLump( *file, size, h, LUMP_BRUSHSIDES, brushsides );
+	if ( ok && !ReadLump( *file, size, h, LUMP_VISIBILITY, vis ) )
+		vis.clear();		// (no culling then, not an error)
 	delete file;
 	// leaf layout: version 0 has the ambient light cube (56 bytes), version 1 doesn't (32); the brush list is at 24
 	int leafSize = h.lumps[LUMP_LEAFS].version == 0 ? 56 : h.lumps[LUMP_LEAFS].version == 1 ? 32 : 0;
@@ -374,17 +389,9 @@ bool CTLMap::Load( const char *pszGameDir, const char *pszLevel, TLOpenMapFn pfn
 	std::vector<char> seen( nBrushes, 0 ), nodeSeen( nNodes, 0 );
 	std::vector<int> stack, used;
 	long long chops = 0;
-	for ( int mi = 1; mi < nModels && mi < (int)ent.size(); mi++ )
+	// the brushes of brush model mi: every leaf under its head node -> used
+	auto modelBrushes = [&]( int mi )
 	{
-		int type = TL_Classify( ent[mi].classname.c_str(), ent[mi].outputs.c_str() );
-		if ( type < 0 )
-			continue;
-		TLModel_t &m = m_Models[mi];
-		m.type = type;
-		m.classname = ent[mi].classname;
-		m.mins.Init( FLT_MAX, FLT_MAX, FLT_MAX );
-		m.maxs.Init( -FLT_MAX, -FLT_MAX, -FLT_MAX );
-		// the model's brushes: every leaf under its head node
 		used.clear();
 		stack.assign( 1, pModels[mi].headnode );
 		while ( !stack.empty() )
@@ -420,23 +427,166 @@ bool CTLMap::Load( const char *pszGameDir, const char *pszLevel, TLOpenMapFn pfn
 			}
 		}
 		for ( int b : used )
-		{
 			seen[b] = 0;
-			AddBrush( pBrushes[b], pSides, nSides, pPlanes, nPlanes, m, chops );
-		}
+	};
+	// a finished model: counted, or emptied when no side survived
+	auto finish = [&]( TLModel_t &m )
+	{
 		if ( m.polys.empty() )
 		{
 			m.mins.Init();
 			m.maxs.Init();
-			continue;
+			return;
 		}
-		m_nTriggers[type]++;
+		m_nTriggers[m.type]++;
 		m_nPolys += (int)m.polys.size();
+	};
+	for ( int mi = 1; mi < nModels && mi < (int)ent.size(); mi++ )
+	{
+		int type = TL_Classify( ent[mi].classname.c_str(), ent[mi].outputs.c_str() );
+		if ( type < 0 )
+			continue;
+		TLModel_t &m = m_Models[mi];
+		m.type = type;
+		m.classname = ent[mi].classname;
+		m.origin = ent[mi].origin;
+		m.angles = ent[mi].angles;
+		m.mins.Init( FLT_MAX, FLT_MAX, FLT_MAX );
+		m.maxs.Init( -FLT_MAX, -FLT_MAX, -FLT_MAX );
+		modelBrushes( mi );
+		for ( size_t k = 0; k < used.size(); k++ )
+			AddBrush( pBrushes[used[k]], pSides, nSides, pPlanes, nPlanes, m, chops, (int)k );
+		finish( m );
+	}
+	// the world's player clips: one model each, after the brush models (in the world's brush order, so the numbers
+	// stay the same for the same file: custom triggers keep them)
+	if ( nModels > 0 )
+	{
+		modelBrushes( 0 );
+		std::sort( used.begin(), used.end() );
+		for ( int b : used )
+		{
+			if ( !( pBrushes[b].contents & CONTENTS_PLAYERCLIP ) )
+				continue;
+			TLModel_t m;
+			m.type = TL_CLIP;
+			m.classname = "playerclip";
+			m.origin.Init();
+			m.angles.Init();
+			m.mins.Init( FLT_MAX, FLT_MAX, FLT_MAX );
+			m.maxs.Init( -FLT_MAX, -FLT_MAX, -FLT_MAX );
+			AddBrush( pBrushes[b], pSides, nSides, pPlanes, nPlanes, m, chops, 0 );
+			if ( m.polys.empty() )
+				continue;
+			m_Models.push_back( std::move( m ) );
+			finish( m_Models.back() );
+		}
+	}
+	// visibility: the world's tree (planes, nodes, each leaf's cluster) + the PVS lump, checked so lookups stay inside
+	if ( nModels > 0 && vis.size() >= 4 )
+	{
+		int nc;
+		memcpy( &nc, vis.data(), 4 );
+		if ( nc > 0 && nc < 65536 && (size_t)8 * nc + 4 <= vis.size() )
+		{
+			m_Planes.resize( nPlanes );
+			for ( int i = 0; i < nPlanes; i++ )
+				m_Planes[i] = { pPlanes[i].normal, pPlanes[i].dist };
+			m_Nodes.resize( nNodes );
+			for ( int i = 0; i < nNodes; i++ )
+				m_Nodes[i] = { pNodes[i].planenum, { pNodes[i].children[0], pNodes[i].children[1] } };
+			m_LeafCluster.resize( nLeafs );
+			for ( int i = 0; i < nLeafs; i++ )
+				memcpy( &m_LeafCluster[i], leafs.data() + (size_t)i * leafSize + 4, 2 );
+			m_Vis.swap( vis );
+			m_nClusters = nc;
+			m_nWorldHead = pModels[0].headnode;
+		}
 	}
 	if ( chops > MAX_CHOPS )
 		Warning( "triggerlook: %s: too many trigger brush sides, the rest are left out\n", path );
 	TL_StrCopy( m_szLevel, pszLevel, sizeof( m_szLevel ) );
-	Msg( "triggerlook: %s: %d teleport, %d booster, %d push, %d gravity, %d other triggers (%d sides)\n", path,
-		 m_nTriggers[TL_TELEPORT], m_nTriggers[TL_BOOSTER], m_nTriggers[TL_PUSH], m_nTriggers[TL_GRAVITY], m_nTriggers[TL_OTHER], m_nPolys );
+	Msg( "triggerlook: %s: %d teleport, %d booster, %d push, %d gravity, %d other triggers, %d clips (%d sides), %d vis clusters\n", path,
+		 m_nTriggers[TL_TELEPORT], m_nTriggers[TL_BOOSTER], m_nTriggers[TL_PUSH], m_nTriggers[TL_GRAVITY], m_nTriggers[TL_OTHER],
+		 m_nTriggers[TL_CLIP], m_nPolys, m_nClusters );
+	return true;
+}
+
+// the leaves of the world tree a box reaches -> their clusters (each once)
+void CTLMap::BoxClusters( const Vector &mins, const Vector &maxs, std::vector<int> &out ) const
+{
+	out.clear();
+	if ( !m_nClusters )
+		return;
+	const Vector c = ( mins + maxs ) * 0.5f, e = ( maxs - mins ) * 0.5f;
+	std::vector<int> stack( 1, m_nWorldHead );
+	std::vector<char> seenNode( m_Nodes.size(), 0 );
+	while ( !stack.empty() )
+	{
+		int n = stack.back();
+		stack.pop_back();
+		if ( n < 0 )
+		{
+			int leaf = -1 - n;
+			int cl = leaf < (int)m_LeafCluster.size() ? m_LeafCluster[leaf] : -1;
+			if ( cl >= 0 && cl < m_nClusters && std::find( out.begin(), out.end(), cl ) == out.end() )
+				out.push_back( cl );
+			continue;
+		}
+		if ( n >= (int)m_Nodes.size() || seenNode[n] || m_Nodes[n].plane < 0 || m_Nodes[n].plane >= (int)m_Planes.size() )
+			continue;
+		seenNode[n] = 1;
+		const Plane_t &pl = m_Planes[m_Nodes[n].plane];
+		const float d = DotProduct( pl.n, c ) - pl.d, r = fabsf( pl.n.x ) * e.x + fabsf( pl.n.y ) * e.y + fabsf( pl.n.z ) * e.z;
+		if ( d > -r )
+			stack.push_back( m_Nodes[n].child[0] );		// (in front)
+		if ( d < r )
+			stack.push_back( m_Nodes[n].child[1] );
+	}
+}
+
+int CTLMap::PointCluster( const Vector &p ) const
+{
+	if ( !m_nClusters )
+		return -1;
+	int n = m_nWorldHead;
+	for ( int steps = 0; n >= 0 && steps < 4096; steps++ )
+	{
+		if ( n >= (int)m_Nodes.size() || m_Nodes[n].plane < 0 || m_Nodes[n].plane >= (int)m_Planes.size() )
+			return -1;
+		const Plane_t &pl = m_Planes[m_Nodes[n].plane];
+		n = m_Nodes[n].child[DotProduct( pl.n, p ) - pl.d >= 0 ? 0 : 1];
+	}
+	if ( n >= 0 )
+		return -1;
+	int leaf = -1 - n;
+	int cl = leaf < (int)m_LeafCluster.size() ? m_LeafCluster[leaf] : -1;
+	return cl < m_nClusters ? cl : -1;
+}
+
+// PVS row of a cluster: run-length coded (a zero byte = that many zero bytes follow)
+bool CTLMap::ClusterPVS( int cluster, std::vector<unsigned char> &bits ) const
+{
+	const int bytes = ( m_nClusters + 7 ) / 8;
+	bits.assign( bytes, 0 );
+	if ( cluster < 0 || cluster >= m_nClusters )
+		return false;
+	int ofs;
+	memcpy( &ofs, m_Vis.data() + 4 + (size_t)8 * cluster, 4 );
+	if ( ofs < 4 || (size_t)ofs >= m_Vis.size() )
+		return false;
+	const unsigned char *in = m_Vis.data() + ofs, *end = m_Vis.data() + m_Vis.size();
+	for ( int o = 0; o < bytes && in < end; )
+	{
+		if ( *in )
+		{
+			bits[o++] = *in++;
+			continue;
+		}
+		if ( in + 1 >= end )
+			break;
+		o += in[1];
+		in += 2;
+	}
 	return true;
 }

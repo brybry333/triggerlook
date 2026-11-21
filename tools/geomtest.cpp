@@ -24,7 +24,7 @@ int main( int argc, char **argv )
 	if ( !map.Load( argv[1], argv[2] ) )
 		return 1;
 	double t1 = Now();
-	int bad = 0, sides = 0, open = 0;
+	int bad = 0, sides = 0, open = 0, grownOff = 0;
 	TLLook_t look = { true, { 40, 40, 40, 128 }, { 255, 255, 255, 255 }, getenv( "GEOM_WIDTH" ) ? atoi( getenv( "GEOM_WIDTH" ) ) : 4 };
 	TLMesh_t mesh;
 	size_t verts = 0, indices = 0;
@@ -102,14 +102,48 @@ int main( int argc, char **argv )
 				}
 			}
 		}
+		// the drawn (grown) shape: every side still flat and exactly 0.5 out from its own
+		{
+			TLModel_t g;
+			const float eps = TL_DRAW_GROW_X100 / 100.0f;
+			TL_ExpandModel( *m, eps, g );
+			if ( getenv( "GEOM_DEBUG" ) && atoi( getenv( "GEOM_DEBUG" ) ) == mi )
+				for ( size_t si = 0; si < m->polys.size(); si++ )
+				{
+					const TLPoly_t &p = m->polys[si];
+					printf( "  side %zu brush %d n %.4f %.4f %.4f:", si, p.brush, p.normal.x, p.normal.y, p.normal.z );
+					for ( int k = 0; k < p.count; k++ )
+					{
+						const Vector &a = m->verts[p.first + k], &b = g.verts[p.first + k];
+						printf( " (%.3f %.3f %.3f -> %+.3f %+.3f %+.3f)", a.x, a.y, a.z, b.x - a.x, b.y - a.y, b.z - a.z );
+					}
+					printf( "\n" );
+				}
+			for ( size_t si = 0; si < m->polys.size(); si++ )
+			{
+				const TLPoly_t &poly = m->polys[si];
+				// every corner of the side has to end up in front of the side's own plane (at least 0.2: a side lying on a
+				// floor must win against it); sharp corners move less than eps (capped), that's fine
+				float least = 1e9f;
+				for ( int k = 0; k < poly.count; k++ )
+					least = MIN( least, DotProduct( poly.normal, g.verts[poly.first + k] - m->verts[poly.first + k] ) );
+				if ( least < 0.2f )
+				{
+					grownOff++;
+					if ( getenv( "GEOM_LIST" ) )
+						printf( "  *%d: grown side %zu only %.3f out\n", mi, si, least );
+				}
+			}
+		}
 		// band + fill cover each side exactly once: their triangles add up to the side's area
 		for ( size_t si = 0; si < mesh.sides.size(); si++ )
 		{
 			const TLSideMesh_t &s = mesh.sides[si];
 			const TLPoly_t &poly = m->polys[si];
 			Vector a2( 0, 0, 0 );
+			const Vector &o = m->verts[poly.first];	// (relative to a corner: clips sit far out, floats lose the area)
 			for ( int i = 0; i < poly.count; i++ )
-				a2 += CrossProduct( m->verts[poly.first + i], m->verts[poly.first + ( i + 1 ) % poly.count] );
+				a2 += CrossProduct( m->verts[poly.first + i] - o, m->verts[poly.first + ( i + 1 ) % poly.count] - o );
 			float sideArea = fabsf( DotProduct( a2, poly.normal ) ) * 0.5f, tris = 0;
 			for ( int k = 0; k + 2 < s.numIndices; k += 3 )
 			{
@@ -140,6 +174,6 @@ int main( int argc, char **argv )
 		fclose( obj );
 	printf( "%s: load %.1f ms, %d sides, mesh with 4-unit border: %zu verts %zu indices (%.2f ms to build all)\n", argv[2],
 			( t1 - t0 ) * 1000, sides, verts, indices, tm * 1000 );
-	printf( "%d open edges (sides of a solid that don't meet another side), %d problems\n", open, bad );
+	printf( "%d open edges (sides of a solid that don't meet another side), %d problems, %d grown sides not out far enough\n", open, bad, grownOff );
 	return bad ? 1 : 0;
 }

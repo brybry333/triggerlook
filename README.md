@@ -1,13 +1,11 @@
 # triggerlook
 
-Client mod for Counter-Strike: Source (64-bit, Linux and Windows): the triggers a server shows you (`!st`,
-`!showtriggers`, `!sts` and the like) drawn in your own look instead of the orange "TRIGGER" texture. Pick a colour,
-an opacity and a border for each kind of trigger in an in-game menu, and watch the triggers in front of you change
-while you click.
+Client mod for Counter-Strike: Source (64-bit, Linux and Windows): the current map's triggers and player clips,
+drawn in your own look. Turn them on in an in-game menu, pick a colour, an opacity and a border for each kind, and
+watch the triggers in front of you change while you click.
 
-It only changes what your client draws. It doesn't show anything the server doesn't already send you: with the
-server's show-triggers off, you see nothing new. The server doesn't need anything installed, and other players
-don't need it.
+Everything happens on your client: the triggers come from the map file the game already loaded, so no `!st` or
+server plugin is needed. The server doesn't need anything installed, and other players don't need it.
 
 Downloads are on the [releases page](https://github.com/brybry333/triggerlook/releases).
 
@@ -37,12 +35,17 @@ On its first start it writes its material and the menu font into the game folder
 
 ## Use
 
-Bind a key to the menu, for example in the console: `bind f6 triggerlook_menu`. Then join a server and turn its
-show-triggers on.
+Bind a key to the menu, for example in the console: `bind f6 triggerlook_menu`.
 
-- **SHOW**: one button per kind of trigger. White = drawn, grey = hidden.
+- **ON / OFF** next to the title: draw this map's triggers at all. OFF = the game as usual. `triggerlook_show`
+  switches it too (bind it to a key if you like).
+- **SHOW**: one button per kind of trigger, and **CLIPS**. White = drawn, grey = hidden.
 - **EDIT**: the same kinds, each in its own colours (fill inside, border round it). The settings below change the
   picked ones. Click picks one, shift + click picks more than one.
+- **CUSTOM TRIGGERS**: **SELECT TRIGGER** closes the menu; look at a trigger (it turns white) and left click it (the
+  key of `+attack`; Esc goes back). It becomes CT-1, CT-2, ... with its own look on that map, even when its kind is
+  hidden, and comes back picked in the menu. Pick these like the EDIT buttons; **DELETE** gives the picked ones their
+  kind's look again. Double click one to name it (up to 24 characters, Enter keeps it, Esc doesn't).
 - **FILL / BORDER**: which part the colours and the opacity change.
 - Colour blocks, your last custom colour, **CUSTOM COLOUR** (a picker, also live), **OPACITY**, **BORDER WIDTH**
   (OFF up to 16 units).
@@ -57,15 +60,20 @@ Esc or X closes it. Settings are saved by themselves, per PC: `~/.config/trigger
 | PUSH | `trigger_push` |
 | GRAVITY | `trigger_gravity`, triggers with a `gravity` output |
 | OTHER | every other `trigger_*` |
+| CLIPS | the map's player clip brushes (`tools/toolsclip`, `tools/toolsplayerclip`), hidden at first |
 
-Console: `triggerlook_menu`, `triggerlook_enable 0/1` (0 = the game's own trigger look), `triggerlook_info`,
-`triggerlook_set <kind|all> [show 0/1] [fill r g b a] [border r g b a] [width n]`. (`triggerlook_cull`,
-`triggerlook_ui` and `triggerlook_selftest` are for testing.)
+Console: `triggerlook_menu`, `triggerlook_show [0/1]`, `triggerlook_enable 0/1` (0 = triggerlook off entirely),
+`triggerlook_info` (what it's doing, and what drawing costs per frame),
+`triggerlook_set <kind|all|clip> [show 0/1] [fill r g b a] [border r g b a] [width n]`. (`triggerlook_cull`,
+`triggerlook_pvs`, `triggerlook_ui` and `triggerlook_selftest` are for testing.)
 
 ## Limits
 
-- It replaces the look of triggers drawn with the standard trigger texture (`tools/toolstrigger`). A trigger brush
-  with some other texture shows both looks.
+- The map file says where triggers are when the map starts. A trigger the map turns on or off, removes or moves
+  later (one attached to a moving door, say) is drawn where it started.
+- While ON, the standard trigger texture (`tools/toolstrigger`) draws nothing, so a server's own show-triggers
+  doesn't draw on top. A trigger brush with some other texture, or a plugin that draws triggers its own way, still
+  shows its look.
 - Tested in game on Linux and on the Windows build under Proton (menu driven with real mouse and keyboard input
   there), not yet on a Windows PC.
 
@@ -74,14 +82,19 @@ Console: `triggerlook_menu`, `triggerlook_enable 0/1` (0 = the game's own trigge
 - The trigger shapes come from the map file: each trigger's brushes are rebuilt from their planes, so every side is
   one polygon with its real edges (the drawn faces are cut up by the map compiler, which would put borders across
   the middle of a side). The border is a band inside each side along its edges.
-- Every frame it goes through the entities the server sent, picks the triggers, and draws their sides that face you
-  and are in view, in one material with per-vertex colour. The game's own trigger material is set to draw nothing
-  while it's on.
+- Player clips are the world's brushes with the player clip flag, rebuilt the same way, one per brush.
+- Each frame it draws the triggers that are in view and that the map's own visibility data says can be seen from
+  where you are (the same check the server uses to decide what to send), the sides that face you, in one material
+  with per-vertex colour. Shapes, placement and meshes are built once per map; see-through triggers are ordered back
+  to front only where they cover each other on screen; a second view of the same frame (the water refraction view)
+  reuses the first. Measured: about 10-20 microseconds per frame with triggers on, nothing with them off.
+- What's drawn is each trigger grown by half a unit (no depth bias): a side lying on a floor shows, one a few units
+  under a floor stays hidden.
 - It draws only in your own view (not in the 3D skybox, reflections or monitors).
 - The map is read through the game's filesystem (the same copy the game loaded), with limits that keep a broken or
   hostile map from hanging or crashing it.
-- No game code is patched: it uses the interfaces the game exports (entity list, model info, leaf system, material
-  system, VGUI, console). On Windows it gets onto the game's main thread through a one-shot message hook on the game
+- No game code is patched: it uses the interfaces the game exports (model info, leaf system, material system, VGUI,
+  console). On Windows it gets onto the game's main thread through a one-shot message hook on the game
   window's thread. A second copy (two loaders) stays off.
 
 ## Building
@@ -105,7 +118,8 @@ only `TriggerLook_Init` and `triggerlook_enable_set`.
 
 **Test:** `LD_LIBRARY_PATH=<game>/bin/linux64 build/geomtest <game>/cstrike maps/<map>.bsp` reads a map's triggers
 and checks every side and its mesh (flat, convex, facing out, closed solids, band and fill covering each side
-exactly once). `GEOM_WIDTH=<n>` sets the border width, `GEOM_LIST=1` lists the triggers.
+exactly once, the drawn shape half a unit out on every side). `GEOM_WIDTH=<n>` sets the border width, `GEOM_LIST=1`
+lists the triggers.
 
 ## Files
 
@@ -113,7 +127,7 @@ exactly once). `GEOM_WIDTH=<n>` sets the border width, `GEOM_LIST=1` lists the t
 |---|---|
 | `src/tl_runtime.cpp` | start, drawing, console commands |
 | `src/tl_ui.cpp` | the menu |
-| `src/tl_map.cpp`, `src/tl_mesh.cpp` | trigger shapes from the map, fill + border meshes |
+| `src/tl_map.cpp`, `src/tl_mesh.cpp` | trigger + clip shapes and visibility from the map, fill + border meshes |
 | `src/tl_look.cpp` | the look per kind and its settings file |
 | `src/tl_con.cpp` | console commands without tier1 |
 | `src/tl_platform_linux.cpp`, `src/tl_platform_win.cpp` | OS layer |
@@ -122,7 +136,7 @@ exactly once). `GEOM_WIDTH=<n>` sets the border width, `GEOM_LIST=1` lists the t
 | `win/launcher.c` | `triggerlook.exe` |
 | `game/` | the material and the menu font (embedded into the mod by `tools/embed.py`) |
 | `tools/geomtest.cpp` | the offline map test |
-| `tools/wininject.c`, `tools/wininput.c` | Windows test helpers (load the DLL; drive the menu with real input) |
+| `tools/wininject.c`, `tools/wininput.c`, `tools/xclick.c` | test helpers (load the DLL; drive the menu with real input) |
 
 ## Credits
 

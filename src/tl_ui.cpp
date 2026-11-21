@@ -2,18 +2,24 @@
 // triggerlook: the trigger menu (triggerlook_menu). Built like the author's paint menu (same panels,
 // colours, fonts, colour blocks and custom colour picker) so the two look the same.
 //
-//   SHOW     one button per trigger type: white = drawn, grey = hidden
+//   ON / OFF next to the title: draw this map's triggers at all (read from the map file, no server command);
+//            OFF = the game's own trigger look. Also triggerlook_show (bindable).
+//   SHOW     one button per trigger type (and CLIPS, the map's player clips): white = drawn, grey = hidden
 //   EDIT     the same types, each in its own colours (fill inside, border round it); the colour settings below
 //            change the picked ones (click = only that one, shift + click = add / remove)
+//   CUSTOM TRIGGERS  SELECT TRIGGER = pick one trigger in the world: it gets its own look (CT-1, CT-2, ... on this
+//            map), picked with the types like another EDIT button; DELETE = the picked ones back to their type's look
 //   FILL / BORDER  which part the colours and OPACITY change; WIDTH = the border's width (OFF = none)
 //
 // Changes show at once on the triggers in front of you (the menu sits at the left and doesn't darken the game).
 // Plain VGUI panels of the client, input polled (VGUI messages are KeyValues in the game's newer layout). Esc closes.
 //=============================================================================
+#include <ctype.h>
 #include <limits.h>
 #include <math.h>
 #include <stdlib.h>
 
+#include <algorithm>
 #include <string>
 #include <vector>
 
@@ -172,13 +178,16 @@ static void ReadWheel( bool reset )
 	s_nWheelDownTick = down;
 }
 
-// a button: pixel box, lighter when hovered, wood when "on". Returns true when clicked.
-static bool Button( int x, int y, int w, int h, const char *label, bool on = false )
+// a button: pixel box, lighter when hovered, wood when "on", greyed out when not enabled. Returns true when clicked.
+static bool Button( int x, int y, int w, int h, const char *label, bool on = false, bool enabled = true )
 {
-	bool hover = Hover( x, y, w, h );
+	bool hover = enabled && Hover( x, y, w, h );
 	int p = MAX( 2, S( 3 ) );
-	PixelBox( x, y, w, h, p, on ? C_WOOD : hover ? C_BTN_HOVER : C_BTN, on ? C_WOOD_LIGHT : hover ? C_WOOD : C_WOOD_DARK );
-	Text( F_BOLD, x + ( w - TextW( F_BOLD, label ) ) / 2, y + ( h - TextH( F_BOLD ) ) / 2, on ? C_BLACK : C_TEXT, label );
+	if ( enabled )
+		PixelBox( x, y, w, h, p, on ? C_WOOD : hover ? C_BTN_HOVER : C_BTN, on ? C_WOOD_LIGHT : hover ? C_WOOD : C_WOOD_DARK );
+	else
+		PixelBox( x, y, w, h, p, C_BTN, C_OFF );
+	Text( F_BOLD, x + ( w - TextW( F_BOLD, label ) ) / 2, y + ( h - TextH( F_BOLD ) ) / 2, !enabled ? C_OFF_EDGE : on ? C_BLACK : C_TEXT, label );
 	return hover && s_bClick;
 }
 
@@ -390,21 +399,56 @@ protected:
 };
 
 //-----------------------------------------------------------------------------
-// The ticker: an always-shown panel that draws nothing; its OnTick runs the runtime every frame
+// The ticker: an always-shown panel; its OnTick runs the runtime every frame, it draws the SELECT TRIGGER bar
 //-----------------------------------------------------------------------------
+static bool s_bPicking;		// SELECT TRIGGER (below)
+static void PaintPickBar();
+
 class CTLTicker : public CTLBasePanel
 {
 public:
 	CTLTicker() : CTLBasePanel( "TriggerLookTicker" ) {}
-	virtual void Paint() {}
+	virtual void Paint() { if ( s_bPicking ) PaintPickBar(); }
 	virtual void OnTick() { TL_Tick(); }
 };
 static CTLTicker s_Ticker;
+
+// a custom trigger's name: the player's, else CT-n (its place among this map's)
+static std::string CTName( int index )
+{
+	if ( index >= 0 && index < (int)g_TLCT.size() && !g_TLCT[index].name.empty() )
+		return g_TLCT[index].name;
+	char n[16];
+	snprintf( n, sizeof( n ), "CT-%d", TL_CTLabel( index ) );
+	return n;
+}
+
+// typing a name: the keys that make a character (US layout), as the input system sees them (a key pressed and let go
+// within one frame still counts: its press tick changes)
+struct TypeKey_t { ButtonCode_t code; char c, shifted; };
+static std::vector<TypeKey_t> TypeKeys()
+{
+	std::vector<TypeKey_t> k;
+	for ( int i = 0; i < 26; i++ )
+		k.push_back( { (ButtonCode_t)( KEY_A + i ), (char)( 'a' + i ), (char)( 'A' + i ) } );
+	for ( int i = 0; i < 10; i++ )
+	{
+		k.push_back( { (ButtonCode_t)( KEY_0 + i ), (char)( '0' + i ), ")!@#$%^&*("[i] } );
+		k.push_back( { (ButtonCode_t)( KEY_PAD_0 + i ), (char)( '0' + i ), (char)( '0' + i ) } );
+	}
+	const TypeKey_t more[] = { { KEY_SPACE, ' ', ' ' }, { KEY_MINUS, '-', '_' }, { KEY_EQUAL, '=', '+' }, { KEY_LBRACKET, '[', '{' },
+		{ KEY_RBRACKET, ']', '}' }, { KEY_SEMICOLON, ';', ':' }, { KEY_APOSTROPHE, '\'', '"' }, { KEY_COMMA, ',', '<' },
+		{ KEY_PERIOD, '.', '>' }, { KEY_SLASH, '/', '?' }, { KEY_BACKSLASH, '\\', '|' }, { KEY_PAD_DIVIDE, '/', '/' },
+		{ KEY_PAD_MULTIPLY, '*', '*' }, { KEY_PAD_MINUS, '-', '-' }, { KEY_PAD_PLUS, '+', '+' }, { KEY_PAD_DECIMAL, '.', '.' } };
+	k.insert( k.end(), more, more + sizeof( more ) / sizeof( more[0] ) );
+	return k;
+}
 
 //-----------------------------------------------------------------------------
 // The menu
 //-----------------------------------------------------------------------------
 static void SetMenuOpen( bool open );
+static void StartPick();
 
 enum { VIEW_MAIN, VIEW_CUSTOM };
 enum { PART_FILL, PART_BORDER };
@@ -419,12 +463,40 @@ public:
 	void Opened()
 	{
 		m_nView = VIEW_MAIN;
+		m_bPickOnRelease = false;
+		m_nRename = -1;
 		s_nDragSlider = -1;
 		ReadWheel( true );
 	}
 
-	// tests / scripts (triggerlook_ui_*)
-	void SetSelection( int mask ) { if ( mask ) m_nSel = mask; }
+	// tests / scripts (triggerlook_ui)
+	void SetSelection( int mask, const std::vector<int> &cts )
+	{
+		if ( !mask && cts.empty() )
+			return;
+		m_nSel = mask;
+		m_SelCT = cts;
+		ValidateSel();
+	}
+	// a trigger just picked in the world: only it, and its button in sight
+	void PickCT( int index )
+	{
+		m_nSel = 0;
+		m_SelCT.assign( 1, index );
+		m_nShowCT = index;
+	}
+	// DELETE: the picked custom triggers go (their triggers get their type's look again)
+	void DeleteSelected()
+	{
+		std::vector<int> del = m_SelCT;
+		std::sort( del.rbegin(), del.rend() );
+		for ( int i : del )
+			if ( i >= 0 && i < (int)g_TLCT.size() )
+				g_TLCT.erase( g_TLCT.begin() + i );
+		m_SelCT.clear();
+		TL_CTListChanged();
+		ValidateSel();
+	}
 	void SetPart( int part ) { m_nPart = part; }
 	void SetView( int view ) { if ( view == VIEW_CUSTOM ) StartCustom(); m_nView = view; }
 
@@ -433,13 +505,28 @@ public:
 	{
 		if ( !IsOpen() )
 			return;
-		if ( s_pEngineVGui->IsGameUIVisible() )
+		if ( s_pEngineVGui->IsGameUIVisible() || s_pInput->WasKeyPressed( KEY_ESCAPE ) )
 		{
-			s_pEngine->ClientCmd_Unrestricted( "gameui_hide" );
-			SetMenuOpen( false );
+			if ( s_pEngineVGui->IsGameUIVisible() )
+				s_pEngine->ClientCmd_Unrestricted( "gameui_hide" );
+			if ( m_nRename >= 0 )
+				EndRename( false );		// Esc while naming: only the naming stops
+			else
+				SetMenuOpen( false );
 		}
-		else if ( s_pInput->WasKeyPressed( KEY_ESCAPE ) )
-			SetMenuOpen( false );
+	}
+
+	// naming a custom trigger: ends with Enter / a click outside / Esc (false: the old name stays)
+	void EndRename( bool keep )
+	{
+		if ( m_nRename < 0 )
+			return;
+		if ( keep && m_nRename < (int)g_TLCT.size() )
+		{
+			g_TLCT[m_nRename].name = TL_CleanName( m_Rename );
+			TL_LookChanged( 0 );
+		}
+		m_nRename = -1;
 	}
 
 	virtual void Paint()
@@ -453,25 +540,44 @@ public:
 		{
 			if ( s_pEngineVGui->IsGameUIVisible() )
 				s_pEngine->ClientCmd_Unrestricted( "gameui_hide" );
-			SetMenuOpen( false );
-			return;
+			if ( m_nRename < 0 )
+			{
+				SetMenuOpen( false );
+				return;
+			}
+			EndRename( false );
 		}
 		int sw, sh;
 		s_pSurface->GetScreenSize( sw, sh );
 		s_flScale = sh / 1080.0f;
 		if ( s_nFontsForHeight != sh || !s_Font[F_BODY] || !s_pSurface->GetFontTall( s_Font[F_BODY] ) )
 			SetupFonts( sh );
+		ValidateSel();
 		s_pInput->GetCursorPos( s_mx, s_my );
 		bool down = s_pInput->IsMouseDown( MOUSE_LEFT );
 		s_bClick = down && !s_bDown;
 		s_bDown = down;
+		if ( m_nRename >= 0 )
+			RenameInput();
+		// the custom trigger buttons: as many rows as fit on the screen, the wheel scrolls the rest
+		const int gapL = S( 10 ), wL = S( PAGE_W );
+		LayoutCTs( wL, ( wL - 4 * gapL ) / 5, gapL );
+		m_nCTRows = MIN( m_nCTRowsAll, MAX( 1, ( sh - S( 48 ) - S( 54 ) - S( 22 ) - ContentH( 0 ) ) / S( 52 ) ) );
+		m_nCTScroll = clamp( m_nCTScroll, 0, m_nCTRowsAll - m_nCTRows );
 		if ( !down )
 			s_nDragSlider = -1;
 		ReadWheel( false );
+		// SELECT TRIGGER: the menu goes once the mouse button is up again (the release stays with the menu)
+		if ( m_bPickOnRelease && !down )
+		{
+			m_bPickOnRelease = false;
+			StartPick();
+			return;
+		}
 
 		// no dimming: the triggers behind are what you're looking at. At the left so the middle stays clear.
 		const int pad = S( 22 );
-		const int W = S( PAGE_W ) + 2 * pad, H = S( 54 ) + ContentH() + pad;
+		const int W = S( PAGE_W ) + 2 * pad, H = S( 54 ) + ContentH( m_nCTRows ) + pad;
 		int x0 = S( 48 ), y0 = ( sh - H ) / 2;
 		PixelBox( x0, y0, W, H, MAX( 2, S( 4 ) ), C_BG, C_WOOD_DARK );
 		Text( F_TITLE, x0 + pad, y0 + S( 14 ), C_WOOD_LIGHT, m_nView == VIEW_CUSTOM ? "CUSTOM COLOUR" : "TRIGGERS" );
@@ -485,6 +591,13 @@ public:
 			m_nView = VIEW_MAIN;
 			s_bClick = false;
 		}
+		// ON / OFF: draw the map's triggers at all
+		if ( m_nView == VIEW_MAIN &&
+			 ShowButton( x0 + pad + TextW( F_TITLE, "TRIGGERS" ) + S( 16 ), y0 + S( 12 ), S( 72 ), S( 28 ), g_bTLShow ? "ON" : "OFF", g_bTLShow ) )
+		{
+			g_bTLShow = !g_bTLShow;
+			TL_LookChanged( 0 );
+		}
 		int cx = x0 + pad, cy = y0 + S( 54 ), cw = W - 2 * pad;
 		if ( m_nView == VIEW_CUSTOM )
 			CustomView( cx, cy, cw );
@@ -495,54 +608,273 @@ public:
 private:
 	int m_nView = VIEW_MAIN;
 	int m_nSel = 1 << TL_TELEPORT;		// the types EDIT picked
+	std::vector<int> m_SelCT;			// the custom triggers picked (indices into g_TLCT)
 	int m_nPart = PART_FILL;
 	int m_nHover = -1;					// type under the cursor (for the line at the bottom)
+	int m_nHoverCT = -1;				// custom trigger under the cursor
+	int m_nCTRows = 0, m_nCTScroll = 0;	// custom trigger rows shown, the first one shown
+	int m_nShowCT = -1;					// scroll to this custom trigger's button
+	std::vector<int> m_CTX, m_CTRow, m_CTW;	// this map's custom trigger buttons: x from the left, row, width
+	int m_nCTRowsAll = 0;
+	int m_nLastClickCT = -1;			// double click = two clicks on one button within 0.4 s
+	double m_flLastClick = 0;
+	int m_nRename = -1;					// the custom trigger being named (index into g_TLCT), -1 = none
+	std::string m_Rename;				// its name so far
+	bool m_bRenameAll = false;			// all of it is selected: typing replaces it
+	int m_RenameRect[4] = {};			// the name field (last frame): a click outside it ends the naming
+	std::vector<int> m_KeyTick;			// the input system's press ticks of TypeKeys(), backspace, enter...
+	double m_flBackHeld = -1;			// backspace held since (repeats)
+	bool m_bPickOnRelease = false;		// SELECT TRIGGER clicked
 	// custom colour picker
 	enum { SV_CELLS = 24, HUE_CELLS = 24 };
 	int m_nHue = 0, m_nSat = 0, m_nVal = 0;
 	bool m_bGreys = false;
 
 	// the same height on both pages
-	int ContentH() const
+	int ContentH( int ctRows ) const
 	{
-		return S( 22 + 42 + 14 ) * 2 + S( 42 + 14 ) + S( 22 + 2 * 80 ) + S( 22 + 70 + 14 ) + S( 22 + 28 + 14 ) + S( 22 );
+		return S( 22 + 42 + 14 ) * 3 + ctRows * S( 52 ) + S( 42 + 14 ) + S( 22 + 2 * 80 ) + S( 22 + 70 + 14 ) + S( 22 + 28 + 14 ) + S( 22 );
 	}
 
-	int First() const { return __builtin_ctz( m_nSel ); }
-	unsigned char *Part( int t ) { return m_nPart == PART_FILL ? g_TLLook[t].fill : g_TLLook[t].border; }
+	bool CTPicked( int index ) const { return std::find( m_SelCT.begin(), m_SelCT.end(), index ) != m_SelCT.end(); }
 
-	// do all picked types have this colour in the current part?
+	// everything picked: the types, then the custom triggers (never empty: ValidateSel)
+	std::vector<TLLook_t *> Picked()
+	{
+		std::vector<TLLook_t *> out;
+		for ( int t = 0; t < TL_TYPES; t++ )
+			if ( m_nSel & ( 1 << t ) )
+				out.push_back( &g_TLLook[t] );
+		for ( int i : m_SelCT )
+			out.push_back( &g_TLCT[i].look );
+		return out;
+	}
+	TLLook_t &FirstLook() { return *Picked()[0]; }
+	void Changed()
+	{
+		TL_LookChanged( m_nSel );
+		for ( int i : m_SelCT )
+			TL_CTChanged( i );
+	}
+
+	// custom triggers not on this map (another map, deleted) drop out; one thing always stays picked
+	void ValidateSel()
+	{
+		const std::vector<int> &cts = TL_MapCTs();
+		for ( size_t k = 0; k < m_SelCT.size(); )
+			if ( std::find( cts.begin(), cts.end(), m_SelCT[k] ) == cts.end() )
+				m_SelCT.erase( m_SelCT.begin() + k );
+			else
+				k++;
+		if ( !m_nSel && m_SelCT.empty() )
+			m_nSel = 1 << TL_TELEPORT;
+		if ( m_nRename >= 0 && std::find( cts.begin(), cts.end(), m_nRename ) == cts.end() )
+			m_nRename = -1;
+	}
+
+	// ---- custom trigger buttons: left to right, as wide as their names, a new row when one doesn't fit --------
+	void LayoutCTs( int w, int minW, int gap )
+	{
+		const std::vector<int> &cts = TL_MapCTs();
+		m_CTX.clear(); m_CTRow.clear(); m_CTW.clear();
+		int x = 0, row = 0;
+		for ( int gi : cts )
+		{
+			std::string label = gi == m_nRename ? m_Rename + "W" : CTName( gi );	// (room for the caret)
+			int cw = clamp( TextW( F_BOLD, label.c_str() ) + S( 28 ), minW, w );
+			if ( x > 0 && x + cw > w )
+			{
+				row++;
+				x = 0;
+			}
+			m_CTX.push_back( x );
+			m_CTRow.push_back( row );
+			m_CTW.push_back( cw );
+			x += cw + gap;
+		}
+		m_nCTRowsAll = cts.empty() ? 0 : row + 1;
+	}
+
+	// ---- naming a custom trigger (double click its button) ----------------------------------------------------
+	void StartRename( int index )
+	{
+		m_nRename = index;
+		m_Rename = CTName( index );
+		m_bRenameAll = true;
+		m_RenameRect[2] = m_RenameRect[3] = 0;
+		m_flBackHeld = -1;
+		ReadKeys( true );
+	}
+
+	// the keys pressed since the last frame, in the order pressed: [ (tick, code index) ]
+	std::vector<TypeKey_t> m_Keys;
+	std::vector<std::pair<int, int> > ReadKeys( bool reset )
+	{
+		if ( m_Keys.empty() )
+		{
+			m_Keys = TypeKeys();
+			const ButtonCode_t special[] = { KEY_BACKSPACE, KEY_DELETE, KEY_ENTER, KEY_PAD_ENTER };
+			for ( ButtonCode_t c : special )
+				m_Keys.push_back( { c, 0, 0 } );
+		}
+		std::vector<std::pair<int, int> > pressed;
+		m_KeyTick.resize( m_Keys.size(), 0 );
+		for ( size_t i = 0; i < m_Keys.size() && s_pInputSystem; i++ )
+		{
+			int tick = s_pInputSystem->GetButtonPressedTick( m_Keys[i].code );
+			if ( !reset && tick != m_KeyTick[i] )
+				pressed.push_back( std::make_pair( tick, (int)i ) );
+			m_KeyTick[i] = tick;
+		}
+		std::sort( pressed.begin(), pressed.end() );
+		return pressed;
+	}
+
+	void RenameInput()
+	{
+		// a click outside the field: done (the click still does what it was for); inside: the selection goes
+		if ( s_bClick )
+		{
+			const int *r = m_RenameRect;
+			if ( r[2] && !Hover( r[0], r[1], r[2], r[3] ) )
+			{
+				EndRename( true );
+				return;
+			}
+			m_bRenameAll = false;
+		}
+		const bool shift = s_pInputSystem && ( s_pInputSystem->IsButtonDown( KEY_LSHIFT ) || s_pInputSystem->IsButtonDown( KEY_RSHIFT ) );
+		const bool caps = s_pInputSystem && s_pInputSystem->IsButtonDown( KEY_CAPSLOCKTOGGLE );
+		const bool ctrl = s_pInputSystem && ( s_pInputSystem->IsButtonDown( KEY_LCONTROL ) || s_pInputSystem->IsButtonDown( KEY_RCONTROL ) );
+		for ( const std::pair<int, int> &p : ReadKeys( false ) )
+		{
+			const TypeKey_t &k = m_Keys[p.second];
+			if ( k.code == KEY_ENTER || k.code == KEY_PAD_ENTER )
+			{
+				EndRename( true );
+				return;
+			}
+			if ( k.code == KEY_BACKSPACE || k.code == KEY_DELETE )
+			{
+				if ( m_bRenameAll )
+					m_Rename.clear();
+				else if ( k.code == KEY_BACKSPACE && !m_Rename.empty() )
+					m_Rename.pop_back();
+				m_bRenameAll = false;
+				if ( k.code == KEY_BACKSPACE )
+					m_flBackHeld = Plat_FloatTime();
+				continue;
+			}
+			if ( ctrl )
+			{
+				if ( k.code == KEY_A )
+					m_bRenameAll = true;		// ctrl + A: all of it
+				continue;
+			}
+			const bool upper = k.code >= KEY_A && k.code <= KEY_Z ? shift != caps : shift;
+			if ( m_bRenameAll )
+				m_Rename.clear();
+			m_bRenameAll = false;
+			if ( (int)m_Rename.size() < TL_NAME_MAX )
+				m_Rename += upper ? k.shifted : k.c;
+		}
+		// backspace held: one character every 35 ms after 0.45 s
+		if ( m_flBackHeld >= 0 )
+		{
+			const double now = Plat_FloatTime();
+			if ( !s_pInputSystem || !s_pInputSystem->IsButtonDown( KEY_BACKSPACE ) )
+				m_flBackHeld = -1;
+			else if ( now - m_flBackHeld > 0.45 )
+			{
+				if ( !m_Rename.empty() )
+					m_Rename.pop_back();
+				m_flBackHeld = now - 0.45 + 0.035;
+			}
+		}
+	}
+
+	// the field in place of the button: the name (selected at first), a blinking caret
+	void RenameField( int x, int y, int w, int h )
+	{
+		m_RenameRect[0] = x; m_RenameRect[1] = y; m_RenameRect[2] = w; m_RenameRect[3] = h;
+		PixelBox( x, y, w, h, MAX( 2, S( 3 ) ), C_BTN, C_WOOD_LIGHT );
+		const int tw = TextW( F_BOLD, m_Rename.c_str() ), th = TextH( F_BOLD );
+		const int tx = x + ( w - tw ) / 2, ty = y + ( h - th ) / 2;
+		if ( m_bRenameAll && !m_Rename.empty() )
+		{
+			Rect( tx - S( 2 ), ty, tw + S( 4 ), th, C_WOOD );
+			Text( F_BOLD, tx, ty, C_BLACK, m_Rename.c_str() );
+		}
+		else
+		{
+			Text( F_BOLD, tx, ty, C_TEXT, m_Rename.c_str() );
+			if ( (long long)( Plat_FloatTime() * 10 ) % 10 < 6 )		// (fmod would need a newer glibc)
+				Rect( tx + tw + S( 1 ), ty, MAX( 1, S( 2 ) ), th, C_TEXT );
+		}
+		Ring( x, y, w, h, C_WHITE );
+	}
+
+	// click = only this one, shift + click = add / remove (one always stays picked)
+	void ClickItem( int typeBit, int ct )
+	{
+		std::vector<int> cts;
+		if ( !ShiftDown() )
+		{
+			m_nSel = typeBit;
+			if ( ct >= 0 )
+				cts.push_back( ct );
+			m_SelCT = cts;
+			return;
+		}
+		cts = m_SelCT;
+		if ( ct >= 0 )
+		{
+			std::vector<int>::iterator it = std::find( cts.begin(), cts.end(), ct );
+			if ( it != cts.end() )
+				cts.erase( it );
+			else
+				cts.push_back( ct );
+		}
+		int sel = m_nSel ^ typeBit;
+		if ( sel || !cts.empty() )
+		{
+			m_nSel = sel;
+			m_SelCT = cts;
+		}
+	}
+
+	unsigned char *Part( TLLook_t &l ) { return m_nPart == PART_FILL ? l.fill : l.border; }
+
+	// does everything picked have this colour in the current part?
 	bool AllHave( int r, int g, int b )
 	{
-		for ( int t = 0; t < TL_TYPES; t++ )
-			if ( ( m_nSel & ( 1 << t ) ) && ( Part( t )[0] != r || Part( t )[1] != g || Part( t )[2] != b ) )
+		for ( TLLook_t *l : Picked() )
+			if ( Part( *l )[0] != r || Part( *l )[1] != g || Part( *l )[2] != b )
 				return false;
 		return true;
 	}
 
-	// a colour for the current part of every picked type; a part that was invisible gets seen (a border gets a width)
+	// a colour for the current part of everything picked; a part that was invisible gets seen (a border gets a width)
 	void ApplyRGB( int r, int g, int b )
 	{
-		for ( int t = 0; t < TL_TYPES; t++ )
+		for ( TLLook_t *l : Picked() )
 		{
-			if ( !( m_nSel & ( 1 << t ) ) )
-				continue;
-			unsigned char *c = Part( t );
+			unsigned char *c = Part( *l );
 			c[0] = (unsigned char)r; c[1] = (unsigned char)g; c[2] = (unsigned char)b;
 			if ( !c[3] )
 				c[3] = m_nPart == PART_FILL ? 115 : 255;
-			if ( m_nPart == PART_BORDER && !g_TLLook[t].width )
-				g_TLLook[t].width = 2;
+			if ( m_nPart == PART_BORDER && !l->width )
+				l->width = 2;
 		}
-		TL_LookChanged( m_nSel );
+		Changed();
 	}
 
 	// ---- the main page ----------------------------------------------------------------------------------
 	void MainView( int x, int y, int w )
 	{
-		const int gap = S( 10 ), label = S( 22 ), bh = S( 42 ), tbw = ( w - 4 * gap ) / 5;
+		const int gap = S( 10 ), label = S( 22 ), bh = S( 42 ), tbw = ( w - ( TL_TYPES - 1 ) * gap ) / TL_TYPES, hw = ( w - gap ) / 2;
 		int cy = y;
-		m_nHover = -1;
+		m_nHover = m_nHoverCT = -1;
 
 		// SHOW: white = drawn, grey = hidden
 		Text( F_BOLD, x, cy, C_WOOD, "SHOW" );
@@ -568,24 +900,69 @@ private:
 		for ( int t = 0; t < TL_TYPES; t++ )
 		{
 			int bx = x + t * ( tbw + gap );
-			if ( TypeButton( bx, cy, tbw, bh, t, ( m_nSel & ( 1 << t ) ) != 0 ) )
-			{
-				if ( ShiftDown() )
-				{
-					int sel = m_nSel ^ ( 1 << t );
-					if ( sel )
-						m_nSel = sel;		// at least one stays picked
-				}
-				else
-					m_nSel = 1 << t;
-			}
+			if ( ItemButton( bx, cy, tbw, bh, g_TLLook[t], g_TLTypeLabel[t], ( m_nSel & ( 1 << t ) ) != 0 ) )
+				ClickItem( 1 << t, -1 );
 			if ( Hover( bx, cy, tbw, bh ) )
 				m_nHover = t;
 		}
 		cy += bh + S( 14 );
 
+		// CUSTOM TRIGGERS: SELECT TRIGGER picks one in the world (CT-1, CT-2, ... in the order picked); their buttons
+		// are picked like the EDIT ones; DELETE = the picked ones get their type's look again
+		const std::vector<int> &cts = TL_MapCTs();
+		const int ctRows = m_nCTRowsAll;
+		Text( F_BOLD, x, cy, C_WOOD, "CUSTOM TRIGGERS" );
+		if ( ctRows > m_nCTRows )
+		{
+			const char *more = "wheel = more";
+			Text( F_SMALL, x + w - TextW( F_SMALL, more ), cy + ( TextH( F_BOLD ) - TextH( F_SMALL ) ) / 2, C_SUB, more );
+		}
+		cy += label;
+		if ( Button( x, cy, hw, bh, "SELECT TRIGGER" ) )
+			m_bPickOnRelease = true;
+		if ( Button( x + hw + gap, cy, hw, bh, "DELETE", false, !m_SelCT.empty() ) )
+			DeleteSelected();
+		cy += bh;
+		for ( size_t k = 0; k < cts.size() && k < m_CTRow.size(); k++ )
+			if ( cts[k] == m_nShowCT || cts[k] == m_nRename )
+				m_nCTScroll = clamp( m_nCTScroll, m_CTRow[k] - m_nCTRows + 1, m_CTRow[k] );
+		m_nShowCT = -1;
+		if ( m_nCTRows && Hover( x, cy, w, m_nCTRows * S( 52 ) + S( 10 ) ) && s_nWheel )
+			m_nCTScroll = clamp( m_nCTScroll - s_nWheel, 0, ctRows - m_nCTRows );
+		for ( size_t k = 0; k < cts.size() && k < m_CTX.size(); k++ )
+		{
+			const int row = m_CTRow[k] - m_nCTScroll, gi = cts[k];
+			if ( row < 0 || row >= m_nCTRows )
+				continue;
+			const int bx = x + m_CTX[k], by = cy + S( 10 ) + row * S( 52 ), bw = m_CTW[k];
+			if ( gi == m_nRename )
+			{
+				RenameField( bx, by, bw, bh );
+				continue;
+			}
+			if ( ItemButton( bx, by, bw, bh, g_TLCT[gi].look, CTName( gi ).c_str(), CTPicked( gi ) ) )
+			{
+				// a second click on the same button soon after: name it
+				const double now = Plat_FloatTime();
+				if ( gi == m_nLastClickCT && now - m_flLastClick < 0.4 && !ShiftDown() )
+				{
+					ClickItem( 0, gi );
+					StartRename( gi );
+					m_nLastClickCT = -1;
+				}
+				else
+				{
+					ClickItem( 0, gi );
+					m_nLastClickCT = gi;
+					m_flLastClick = now;
+				}
+			}
+			if ( Hover( bx, by, bw, bh ) )
+				m_nHoverCT = gi;
+		}
+		cy += m_nCTRows * S( 52 ) + S( 14 );
+
 		// FILL / BORDER: which part the colours and OPACITY change
-		int hw = ( w - gap ) / 2;
 		if ( Button( x, cy, hw, bh, "FILL", m_nPart == PART_FILL ) )
 			m_nPart = PART_FILL;
 		if ( Button( x + hw + gap, cy, hw, bh, "BORDER", m_nPart == PART_BORDER ) )
@@ -620,9 +997,9 @@ private:
 		cy += thumb + S( 14 );
 
 		// OPACITY (the current part) and WIDTH (the border), side by side
-		const TLLook_t &first = g_TLLook[First()];
+		TLLook_t &first = FirstLook();
 		int sx2 = x + hw + gap;
-		int pct = (int)( Part( First() )[3] * 100 / 255.0f + 0.5f );
+		int pct = (int)( Part( first )[3] * 100 / 255.0f + 0.5f );
 		char val[32];
 		snprintf( val, sizeof( val ), "%d%%", pct );
 		Text( F_BOLD, x, cy, C_WOOD, m_nPart == PART_FILL ? "FILL OPACITY" : "BORDER OPACITY" );
@@ -636,46 +1013,58 @@ private:
 		cy += label;
 		if ( Slider( 0, x, cy, hw, S( 28 ), pct, 0, 100 ) )
 		{
-			for ( int t = 0; t < TL_TYPES; t++ )
-				if ( m_nSel & ( 1 << t ) )
-					Part( t )[3] = (unsigned char)( pct * 255 / 100.0f + 0.5f );
-			TL_LookChanged( m_nSel );
+			for ( TLLook_t *l : Picked() )
+				Part( *l )[3] = (unsigned char)( pct * 255 / 100.0f + 0.5f );
+			Changed();
 		}
 		int width = first.width;
 		if ( Slider( 1, sx2, cy, hw, S( 28 ), width, 0, TL_MAX_WIDTH ) )
 		{
-			for ( int t = 0; t < TL_TYPES; t++ )
-				if ( m_nSel & ( 1 << t ) )
-				{
-					g_TLLook[t].width = width;
-					if ( width && !g_TLLook[t].border[3] )
-						g_TLLook[t].border[3] = 255;
-				}
-			TL_LookChanged( m_nSel );
+			for ( TLLook_t *l : Picked() )
+			{
+				l->width = width;
+				if ( width && !l->border[3] )
+					l->border[3] = 255;
+			}
+			Changed();
 		}
 		cy += S( 28 ) + S( 14 );
 
-		// the line at the bottom: why nothing shows, else what the type under the cursor (or the first picked) has
+		// the line at the bottom: why nothing shows, else what the type / custom trigger under the cursor (or the
+		// first picked) has
 		char line[256];
-		int shown = 0;
+		int inMap = 0;
 		for ( int t = 0; t < TL_TYPES; t++ )
-			shown += TL_ShownNow( t );
-		if ( !TL_Active() )
+			inMap += TL_InMap( t );
+		if ( m_nRename >= 0 )
+			snprintf( line, sizeof( line ), "type a name (up to %d)  \xC2\xB7  Enter: done  \xC2\xB7  Esc: keep the old one  \xC2\xB7  empty = CT-%d",
+						(int)TL_NAME_MAX, TL_CTLabel( m_nRename ) );
+		else if ( !TL_Active() )
 			TL_StrCopy( line, "off: triggerlook_enable is 0 (the game's own trigger look)", sizeof( line ) );
-		else if ( !shown )
-			TL_StrCopy( line, "the server isn't showing triggers here: type !st in chat (or !sts)", sizeof( line ) );
+		else if ( !g_bTLShow )
+			TL_StrCopy( line, "OFF: click ON at the top to draw this map's triggers (or bind a key to triggerlook_show)", sizeof( line ) );
+		else if ( !inMap )
+			TL_StrCopy( line, "this map has no triggers or clips", sizeof( line ) );
 		else
 		{
-			int t = m_nHover >= 0 ? m_nHover : First();
-			const TLLook_t &l = g_TLLook[t];
-			char border[64];
+			const int ct = m_nHoverCT >= 0 ? m_nHoverCT : m_nHover < 0 && !m_nSel ? m_SelCT[0] : -1;
+			const int t = m_nHover >= 0 ? m_nHover : m_nSel ? __builtin_ctz( m_nSel ) : 0;
+			const TLLook_t &l = ct >= 0 ? g_TLCT[ct].look : g_TLLook[t];
+			char what[64], border[64];
+			if ( ct >= 0 )
+			{
+				int type = TL_CTType( ct );
+				snprintf( what, sizeof( what ), "%s (%s)", CTName( ct ).c_str(), type >= 0 ? g_TLTypeLabel[type] : "?" );
+			}
+			else
+				snprintf( what, sizeof( what ), "%s  \xC2\xB7  %d in the map", g_TLTypeLabel[t], TL_InMap( t ) );
 			if ( l.width && l.border[3] )
 				snprintf( border, sizeof( border ), "border #%02X%02X%02X %d%% width %d", l.border[0], l.border[1], l.border[2],
 							(int)( l.border[3] * 100 / 255.0f + 0.5f ), l.width );
 			else
 				TL_StrCopy( border, "no border", sizeof( border ) );
-			snprintf( line, sizeof( line ), "%s  \xC2\xB7  %d shown  \xC2\xB7  fill #%02X%02X%02X %d%%  \xC2\xB7  %s%s", g_TLTypeLabel[t],
-						TL_ShownNow( t ), l.fill[0], l.fill[1], l.fill[2], (int)( l.fill[3] * 100 / 255.0f + 0.5f ), border, l.show ? "" : "  \xC2\xB7  hidden" );
+			snprintf( line, sizeof( line ), "%s  \xC2\xB7  fill #%02X%02X%02X %d%%  \xC2\xB7  %s%s", what, l.fill[0], l.fill[1], l.fill[2],
+						(int)( l.fill[3] * 100 / 255.0f + 0.5f ), border, ct < 0 && !l.show ? "  \xC2\xB7  hidden" : "" );
 		}
 		Text( F_SMALL, x, cy + ( S( 22 ) - TextH( F_SMALL ) ) / 2, C_SUB, FitRight( F_SMALL, line, w ).c_str() );
 	}
@@ -693,11 +1082,10 @@ private:
 		return hover && s_bClick;
 	}
 
-	// EDIT: the type's fill colour inside, its border colour round it (a darker / lighter edge without a border),
-	// a white ring when picked
-	bool TypeButton( int x, int y, int w, int h, int t, bool sel )
+	// EDIT / CUSTOM TRIGGERS: the fill colour inside, the border colour round it (a darker / lighter edge without a
+	// border), a white ring when picked
+	bool ItemButton( int x, int y, int w, int h, const TLLook_t &l, const char *label, bool sel )
 	{
-		const TLLook_t &l = g_TLLook[t];
 		bool hover = Hover( x, y, w, h );
 		Col fill = { l.fill[0], l.fill[1], l.fill[2], 255 };
 		Col edge = l.width && l.border[3] ? Col{ l.border[0], l.border[1], l.border[2], 255 } : Light( fill ) ? Shade( fill, 0.6f ) : Lift( fill, 0.3f );
@@ -705,7 +1093,6 @@ private:
 		PixelBox( x, y, w, h, p, fill, edge );
 		if ( hover )
 			Rect( x + p, y + p, w - 2 * p, h - 2 * p, Light( fill ) ? Col{ 0, 0, 0, 30 } : Col{ 255, 255, 255, 30 } );
-		const char *label = g_TLTypeLabel[t];
 		Text( F_BOLD, x + ( w - TextW( F_BOLD, label ) ) / 2, y + ( h - TextH( F_BOLD ) ) / 2, Light( fill ) ? C_BLACK : C_WHITE, label );
 		if ( sel || hover )
 			Ring( x, y, w, h, sel ? C_WHITE : C_WOOD );
@@ -715,7 +1102,7 @@ private:
 	// ---- custom colour: the paint menu's picker; every change shows on the triggers at once --------------
 	void StartCustom()
 	{
-		const unsigned char *c = Part( First() );
+		const unsigned char *c = Part( FirstLook() );
 		int rgb[3] = { c[0], c[1], c[2] };
 		float hh, ss, vv;
 		RgbToHsv( rgb, &hh, &ss, &vv );
@@ -807,6 +1194,12 @@ private:
 				ly += TextH( F_SMALL ) + S( 2 );
 				Text( F_SMALL, rx, ly, C_TEXT, g_TLTypeLabel[t] );
 			}
+		// (as many custom triggers as fit above DONE)
+		for ( size_t k = 0; k < m_SelCT.size() && ly + 2 * ( TextH( F_SMALL ) + S( 2 ) ) < y + sv - S( 42 ); k++ )
+		{
+			ly += TextH( F_SMALL ) + S( 2 );
+			Text( F_SMALL, rx, ly, C_TEXT, CTName( m_SelCT[k] ).c_str() );
+		}
 		if ( Button( rx, y + sv - S( 42 ), rw, S( 42 ), "DONE" ) )
 			m_nView = VIEW_MAIN;
 	}
@@ -814,17 +1207,204 @@ private:
 
 static CTLMenu s_Menu;
 
+//-----------------------------------------------------------------------------
+// SELECT TRIGGER: the menu closes, you look around, and the +attack key (left click) picks the drawn trigger under
+// the crosshair (lit up white, tl_runtime.cpp): it becomes a custom trigger and the menu opens again with it picked.
+// The key is borrowed while picking (bound to +triggerlook_pick, so it doesn't shoot) and given back after; a key
+// still bound to it (the game closed mid-pick) gets +attack back on the next map. Esc = back to the menu.
+//-----------------------------------------------------------------------------
+static std::string s_PickKey, s_PickKeyOld;	// the borrowed key ("MOUSE1") and its bind
+static bool s_bReopenMenu;					// Esc: back to the menu once the pause menu is gone
+static int s_nPickDown = -1;				// the trigger under the crosshair when the pick key went down
+static int s_nPicked = -1;					// ... when it came up: picked
+static char s_szBindsChecked[MAX_PATH];		// the map the left-over bind was checked on
+
+static void SetBind( const char *key, const std::string &cmd )
+{
+	char line[600];
+	if ( cmd.empty() )
+		snprintf( line, sizeof( line ), "unbind \"%s\"\n", key );
+	else
+	{
+		std::string c = cmd;
+		std::replace( c.begin(), c.end(), '"', '\'' );
+		snprintf( line, sizeof( line ), "bind \"%s\" \"%s\"\n", key, c.c_str() );
+	}
+	s_pEngine->ClientCmd_Unrestricted( line );
+}
+
+static void StartPick()
+{
+	if ( s_bPicking || !s_pEngine )
+		return;
+	// MOUSE1 when it attacks, else whichever key does; no attack key at all: MOUSE1 anyway
+	const char *mouse1 = s_pEngine->Key_BindingForKey( MOUSE_LEFT );
+	const char *key = mouse1 && !TL_StrICmp( mouse1, "+attack" ) ? "MOUSE1" : s_pEngine->Key_LookupBinding( "+attack" );
+	s_PickKey = key && *key ? key : "MOUSE1";
+	s_PickKeyOld = key && *key ? "+attack" : mouse1 ? mouse1 : "";
+	if ( s_PickKeyOld == "+triggerlook_pick" )
+		s_PickKeyOld = "+attack";
+	SetBind( s_PickKey.c_str(), "+triggerlook_pick" );
+	s_nPickDown = s_nPicked = -1;
+	SetMenuOpen( false );
+	s_bPicking = true;
+	TL_SetPicking( true );
+}
+
+// model >= 0: that trigger was picked (its custom trigger is picked in the menu); reopen: the menu again
+static void EndPick( bool reopen, int model )
+{
+	if ( !s_bPicking )
+		return;
+	s_bPicking = false;
+	TL_SetPicking( false );
+	SetBind( s_PickKey.c_str(), s_PickKeyOld );
+	const int ct = model >= 0 ? TL_PickedCT( model ) : -1;
+	if ( !reopen )
+		return;
+	SetMenuOpen( true );
+	if ( ct >= 0 )
+		s_Menu.PickCT( ct );
+}
+
+// The trigger under the crosshair when the key goes down is picked when it comes up (the menu opens with the button
+// up, on the next tick: not in the middle of the game's key handling).
+static void CmdPickDown( const CCommand &args )
+{
+	if ( !s_bPicking )
+	{
+		if ( s_pEngine )
+			s_pEngine->ClientCmd_Unrestricted( "+attack\n" );	// a bind left over: still shoots
+		return;
+	}
+	s_nPickDown = TL_PickHover();
+}
+static void CmdPickUp( const CCommand &args )
+{
+	if ( !s_bPicking )
+	{
+		if ( s_pEngine )
+			s_pEngine->ClientCmd_Unrestricted( "-attack\n" );
+		return;
+	}
+	s_nPicked = s_nPickDown;		// (TLUI_Tick ends the pick: not in the middle of the game's key handling)
+	s_nPickDown = -1;
+}
+static ConCommand s_cmdPickDown( "+triggerlook_pick", CmdPickDown, "triggerlook: SELECT TRIGGER picks the trigger under the crosshair (bound while picking)" );
+static ConCommand s_cmdPickUp( "-triggerlook_pick", CmdPickUp, "triggerlook: (the key went up)" );
+
+// every frame (TL_Tick): leaving / Esc / triggerlook off while picking; a left-over bind
+void TLUI_Tick()
+{
+	if ( !s_pEngine || !TLUI_Ready() )
+		return;
+	if ( s_bPicking )
+	{
+		if ( s_nPicked >= 0 )
+		{
+			const int model = s_nPicked;
+			s_nPicked = -1;
+			EndPick( true, model );
+		}
+		else if ( !s_pEngine->IsInGame() )
+			EndPick( false, -1 );
+		else if ( s_pEngineVGui->IsGameUIVisible() )
+		{
+			// Esc: the engine opens its pause menu first; hide it, the menu opens once it's gone
+			s_pEngine->ClientCmd_Unrestricted( "gameui_hide\n" );
+			EndPick( false, -1 );
+			s_bReopenMenu = true;
+		}
+		else if ( !TL_Active() )
+			EndPick( true, -1 );
+	}
+	else if ( s_bReopenMenu )
+	{
+		if ( !s_pEngine->IsInGame() )
+			s_bReopenMenu = false;
+		else if ( !s_pEngineVGui->IsGameUIVisible() )
+		{
+			s_bReopenMenu = false;
+			SetMenuOpen( true );
+		}
+	}
+	else if ( s_pEngine->IsInGame() && strcmp( s_szBindsChecked, s_pEngine->GetLevelName() ) )
+	{
+		TL_StrCopy( s_szBindsChecked, s_pEngine->GetLevelName(), sizeof( s_szBindsChecked ) );
+		if ( const char *key = s_pEngine->Key_LookupBinding( "+triggerlook_pick" ) )
+		{
+			SetBind( key, "+attack" );
+			Msg( "triggerlook: gave %s back to +attack (the game closed while picking a trigger)\n", key );
+		}
+	}
+}
+
+// "MOUSE1" -> "Left click"
+static std::string KeyLabel( const std::string &key )
+{
+	if ( !TL_StrICmp( key.c_str(), "MOUSE1" ) ) return "Left click";
+	if ( !TL_StrICmp( key.c_str(), "MOUSE2" ) ) return "Right click";
+	if ( !TL_StrICmp( key.c_str(), "MOUSE3" ) ) return "Middle click";
+	std::string s = key;
+	for ( char &c : s )
+		c = (char)toupper( (unsigned char)c );
+	return s;
+}
+
+// the bar at the bottom while picking (the paint keys' hint bar)
+static void PaintPickBar()
+{
+	if ( !s_pEngine->IsInGame() || s_pEngineVGui->IsGameUIVisible() )
+		return;
+	int sw, sh;
+	s_pSurface->GetScreenSize( sw, sh );
+	s_flScale = sh / 1080.0f;
+	if ( s_nFontsForHeight != sh || !s_Font[F_BODY] || !s_pSurface->GetFontTall( s_Font[F_BODY] ) )
+		SetupFonts( sh );
+	const int model = TL_PickHover(), type = TL_ModelType( model ), ct = TL_ModelCT( model );
+	int inMap = 0;
+	for ( int t = 0; t < TL_TYPES; t++ )
+		inMap += TL_InMap( t );
+	const bool shown = g_bTLShow && inMap;
+	char head[160], keys[200];
+	if ( ct >= 0 )
+		snprintf( head, sizeof( head ), "SELECT TRIGGER  \xC2\xB7  %s (%s)", CTName( ct ).c_str(), g_TLTypeLabel[type] );
+	else if ( type >= 0 )
+		snprintf( head, sizeof( head ), "SELECT TRIGGER  \xC2\xB7  %s", g_TLTypeLabel[type] );
+	else
+		TL_StrCopy( head, "SELECT TRIGGER", sizeof( head ) );
+	if ( shown )
+		snprintf( keys, sizeof( keys ), "%s a trigger to pick it  \xC2\xB7  Esc: back to the menu", KeyLabel( s_PickKey ).c_str() );
+	else
+		TL_StrCopy( keys, g_bTLShow ? "this map has no triggers  \xC2\xB7  Esc: back to the menu" : "triggers are OFF: turn them ON in the menu  \xC2\xB7  Esc: back to the menu", sizeof( keys ) );
+	int bw = MIN( sw - S( 40 ), MAX( TextW( F_BOLD, head ), TextW( F_SMALL, keys ) ) + S( 56 ) );
+	int bh = S( 16 ) + TextH( F_BOLD ) + S( 6 ) + TextH( F_SMALL ) + S( 14 );
+	int bx = ( sw - bw ) / 2, by = sh - bh - S( 140 );
+	PixelBox( bx, by, bw, bh, MAX( 2, S( 3 ) ), { 18, 17, 20, 225 }, C_WOOD_DARK );
+	Rect( bx + S( 12 ), by + S( 14 ), S( 8 ), TextH( F_BOLD ), type >= 0 ? C_WHITE : C_WOOD );
+	Text( F_BOLD, bx + S( 28 ), by + S( 14 ), C_TEXT, head );
+	Text( F_SMALL, bx + S( 28 ), by + S( 14 ) + TextH( F_BOLD ) + S( 6 ), C_SUB, keys );
+}
+
 static void SetMenuOpen( bool open )
 {
 	if ( !s_pSurface || !s_Menu.GetVPanel() )
 		return;
+	if ( open )
+	{
+		EndPick( false, -1 );		// (triggerlook_menu while picking: back to the menu)
+		s_bReopenMenu = false;
+	}
 	if ( open && s_pEngine && s_pEngine->Con_IsVisible() )
 		s_pEngine->ClientCmd_Unrestricted( "hideconsole" );
 	s_bDown = true;		// a click that opened it doesn't count
 	if ( open && !s_Menu.IsOpen() )
 		s_Menu.Opened();
 	if ( !open )
+	{
+		s_Menu.EndRename( true );
 		TL_LookFlush();		// (a quit right after closing keeps the change)
+	}
 	s_Menu.Show( open );
 }
 
@@ -857,21 +1437,39 @@ bool TLUI_Init( IVEngineClient *pEngine )
 // Test helpers: the menu's state without clicking, and a timed console script (cfg "wait" doesn't work at
 // uncapped fps): lines "<seconds after the previous line> <command>", "#" comments
 //-----------------------------------------------------------------------------
-CON_COMMAND( triggerlook_ui, "triggerlook_ui select <types,...> | part fill|border | view main|custom | mark <text>: set the menu's state, or mark the info file (testing)" )
+CON_COMMAND( triggerlook_ui, "triggerlook_ui select <types,ct1,...> | part fill|border | view main|custom | pickmode | delete | mark <text>: set the menu's state, or mark the info file (testing)" )
 {
+	if ( args.ArgC() == 2 && !TL_StrICmp( args[1], "pickmode" ) )
+	{
+		StartPick();		// = SELECT TRIGGER (then +triggerlook_pick = the click)
+		return;
+	}
+	if ( args.ArgC() == 2 && !TL_StrICmp( args[1], "delete" ) )
+	{
+		s_Menu.DeleteSelected();
+		return;
+	}
 	if ( args.ArgC() < 3 )
 	{
-		Msg( "usage: triggerlook_ui select <type[,type...]|all> | part fill|border | view main|custom\n" );
+		Msg( "usage: triggerlook_ui select <type|ctN[,...]|all> | part fill|border | view main|custom | pickmode | delete\n" );
 		return;
 	}
 	if ( !TL_StrICmp( args[1], "select" ) )
 	{
 		int mask = 0;
+		std::vector<int> cts;
+		const std::vector<int> &mapCTs = TL_MapCTs();
 		char list[256];
 		TL_StrCopy( list, args.ArgS() + strlen( args[1] ) + 1, sizeof( list ) );
 		for ( char *p = strtok( list, ", " ); p; p = strtok( NULL, ", " ) )
-			mask |= TL_TypeMask( p );
-		s_Menu.SetSelection( mask );
+		{
+			int n = !TL_StrNICmp( p, "ct", 2 ) ? atoi( p + 2 + ( p[2] == '-' ) ) : 0;
+			if ( n > 0 && n <= (int)mapCTs.size() )
+				cts.push_back( mapCTs[n - 1] );
+			else
+				mask |= TL_TypeMask( p );
+		}
+		s_Menu.SetSelection( mask, cts );
 	}
 	else if ( !TL_StrICmp( args[1], "part" ) )
 		s_Menu.SetPart( !TL_StrICmp( args[2], "border" ) ? PART_BORDER : PART_FILL );
