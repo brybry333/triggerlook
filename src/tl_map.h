@@ -85,9 +85,16 @@ public:
 
 	// Visibility (the map's PVS, what the server uses to decide what to send): the clusters a world box touches, the
 	// cluster a point is in (-1 = solid / outside / no vis data), and that cluster's PVS row (bit per cluster)
-	void BoxClusters( const Vector &mins, const Vector &maxs, std::vector<int> &out ) const;
+	void BoxClusters( const Vector &mins, const Vector &maxs, std::vector<int> &out, std::vector<int> *areas = NULL ) const;
 	int PointCluster( const Vector &p ) const;
 	bool ClusterPVS( int cluster, std::vector<unsigned char> &bits ) const;
+	// Areas (parts of the map split by area portals; the game draws nothing, and servers send nothing, from an area
+	// that only joins the camera's through closed portals): BoxClusters' areas = the ones a box touches, the area a
+	// point is in (0 = solid / outside / the map has no areas), and AreaFlood = the areas drawn from there
+	int PointArea( const Vector &p ) const;
+	bool AreaFlood( int area, std::vector<unsigned char> &bits ) const;
+	int NumAreas() const { return (int)m_Areas.size(); }
+	int		m_nPortalsShut = 0;		// area portals closed for good (a func_areaportal nothing can open)
 
 	// the world's solid-looking see-through surfaces (pfnSolidLooking), world space: polygon k = m_OccVerts
 	// [m_OccFirst[k], m_OccFirst[k + 1])
@@ -98,12 +105,18 @@ public:
 private:
 	struct Plane_t { Vector n; float d; };
 	struct Node_t { int plane, child[2]; };
+	struct Area_t { int first, count; };		// into m_Portals (checked at load)
+	struct Portal_t { int other; bool open; };	// one side of an area portal: the area it leads to
+	int PointLeaf( const Vector &p ) const;
 	std::vector<Plane_t> m_Planes;
 	std::vector<Node_t> m_Nodes;
 	std::vector<short> m_LeafCluster;
+	std::vector<unsigned short> m_LeafArea;
 	std::vector<unsigned char> m_Vis;	// the visibility lump as is
+	std::vector<Area_t> m_Areas;		// empty = no area culling
+	std::vector<Portal_t> m_Portals;
 	int		m_nClusters = 0, m_nWorldHead = 0;
-	mutable std::vector<char> m_ClusterMark, m_NodeMark;	// BoxClusters' scratch (cleared after each call)
+	mutable std::vector<char> m_ClusterMark, m_NodeMark, m_AreaMark;	// BoxClusters' scratch (cleared after each call)
 	mutable std::vector<int> m_Stack, m_Visited;
 
 	std::vector<TLModel_t> m_Models;	// by brush model number (*N); 0 = the world, never a trigger; then the clips

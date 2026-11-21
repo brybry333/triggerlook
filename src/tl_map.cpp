@@ -39,7 +39,8 @@ namespace
 {
 	enum { LUMP_ENTITIES = 0, LUMP_PLANES = 1, LUMP_TEXDATA = 2, LUMP_VERTEXES = 3, LUMP_VISIBILITY = 4, LUMP_NODES = 5, LUMP_TEXINFO = 6,
 		   LUMP_FACES = 7, LUMP_LEAFS = 10, LUMP_EDGES = 12, LUMP_SURFEDGES = 13, LUMP_MODELS = 14, LUMP_LEAFBRUSHES = 17,
-		   LUMP_BRUSHES = 18, LUMP_BRUSHSIDES = 19, LUMP_TEXDATA_STRING_DATA = 43, LUMP_TEXDATA_STRING_TABLE = 44, NUM_LUMPS = 64 };
+		   LUMP_BRUSHES = 18, LUMP_BRUSHSIDES = 19, LUMP_AREAS = 20, LUMP_AREAPORTALS = 21, LUMP_TEXDATA_STRING_DATA = 43,
+		   LUMP_TEXDATA_STRING_TABLE = 44, NUM_LUMPS = 64 };
 
 	#pragma pack(push, 1)
 	struct lump_t { int fileofs, filelen, version; int uncompressedSize; };
@@ -53,7 +54,10 @@ namespace
 					 unsigned char styles[4]; int lightofs; float area; int lmMins[2], lmSize[2]; int origFace;
 					 unsigned short numPrims, firstPrimID; unsigned int smoothingGroups; };
 	struct dedge_t { unsigned short v[2]; };
+	struct darea_t { int numareaportals, firstareaportal; };
+	struct dareaportal_t { unsigned short portalKey, otherArea, firstClipVert, numClipVerts; int planenum; };
 	static_assert( sizeof( dface_t ) == 56, "dface_t layout" );
+	static_assert( sizeof( dareaportal_t ) == 12, "dareaportal_t layout" );
 	#pragma pack(pop)
 
 	// limits against broken or hostile maps (maps come from servers): no lump this reader needs is anywhere near these
@@ -144,9 +148,11 @@ namespace
 		return TLP_IsFile( found );
 	}
 
-	// the entity lump: brush entities (model "*N") -> classname + every output value
+	// the entity lump: brush entities (model "*N") -> classname + every output value; area portals (portalnumber N)
+	// -> portalOpen[N]: 0 = a func_areaportal that starts closed and nothing can open (no name, no door: the map's
+	// logic can't reach it), else 1 (open, or opened / closed while playing: counted as open)
 	struct Ent_t { std::string classname, outputs; Vector origin = Vector( 0, 0, 0 ), angles = Vector( 0, 0, 0 ); };
-	void ParseEntities( const char *text, int len, std::vector<Ent_t> &models )
+	void ParseEntities( const char *text, int len, std::vector<Ent_t> &models, std::vector<char> &portalOpen )
 	{
 		const char *p = text, *end = text + len;
 		while ( p < end )
@@ -155,7 +161,8 @@ namespace
 			if ( p >= end ) break;
 			p++;
 			Ent_t e;
-			int model = -1;
+			int model = -1, portal = -1;
+			bool named = false, startOpen = true;
 			while ( p < end && *p != '}' )
 			{
 				char key[128], value[2048];
@@ -176,6 +183,9 @@ namespace
 				if ( !TL_StrICmp( key, "classname" ) ) e.classname = value;
 				else if ( !TL_StrICmp( key, "model" ) && value[0] == '*' ) model = atoi( value + 1 );
 				else if ( !TL_StrNICmp( key, "On", 2 ) ) { e.outputs += value; e.outputs += '\n'; }
+				else if ( !TL_StrICmp( key, "portalnumber" ) ) portal = atoi( value );
+				else if ( !TL_StrICmp( key, "StartOpen" ) ) startOpen = atoi( value ) != 0;
+				else if ( !TL_StrICmp( key, "targetname" ) || !TL_StrICmp( key, "target" ) ) named = named || value[0];
 				else if ( !TL_StrICmp( key, "origin" ) || !TL_StrICmp( key, "angles" ) )
 				{
 					float v[3] = { 0, 0, 0 };
@@ -188,6 +198,12 @@ namespace
 				if ( (int)models.size() <= model )
 					models.resize( model + 1 );
 				models[model] = e;
+			}
+			if ( portal > 0 && portal < 65536 )
+			{
+				if ( (int)portalOpen.size() <= portal )
+					portalOpen.resize( portal + 1, 1 );
+				portalOpen[portal] = TL_StrICmp( e.classname.c_str(), "func_areaportal" ) || named || startOpen;
 			}
 		}
 	}
@@ -337,8 +353,12 @@ void CTLMap::Clear()
 	m_Planes.clear();
 	m_Nodes.clear();
 	m_LeafCluster.clear();
+	m_LeafArea.clear();
 	m_Vis.clear();
-	m_nClusters = m_nWorldHead = 0;
+	m_Areas.clear();
+	m_Portals.clear();
+	m_AreaMark.clear();
+	m_nClusters = m_nWorldHead = m_nPortalsShut = 0;
 	m_OccVerts.clear();
 	m_OccFirst.clear();
 	m_OccMaterials.clear();
@@ -379,6 +399,9 @@ bool CTLMap::Load( const char *pszGameDir, const char *pszLevel, TLOpenMapFn pfn
 		 ReadLump( *file, size, h, LUMP_BRUSHES, brushes ) && ReadLump( *file, size, h, LUMP_BRUSHSIDES, brushsides );
 	if ( ok && !ReadLump( *file, size, h, LUMP_VISIBILITY, vis ) )
 		vis.clear();		// (no culling then, not an error)
+	std::vector<unsigned char> areas, areaportals;
+	if ( ok && !( ReadLump( *file, size, h, LUMP_AREAS, areas ) && ReadLump( *file, size, h, LUMP_AREAPORTALS, areaportals ) ) )
+		areas.clear();		// (same)
 	// the world's faces + their materials (only when asked: solid-looking see-through surfaces)
 	std::vector<unsigned char> faces, texinfo, texdata, strdata, strtable, vertexes, edgesL, surfedges;
 	bool occOk = ok && pfnSolidLooking && ReadLump( *file, size, h, LUMP_FACES, faces ) && ReadLump( *file, size, h, LUMP_TEXINFO, texinfo ) &&
@@ -395,7 +418,8 @@ bool CTLMap::Load( const char *pszGameDir, const char *pszLevel, TLOpenMapFn pfn
 	}
 
 	std::vector<Ent_t> ent;
-	ParseEntities( (const char *)ents.data(), (int)ents.size(), ent );
+	std::vector<char> portalOpen;
+	ParseEntities( (const char *)ents.data(), (int)ents.size(), ent, portalOpen );
 
 	const dplane_t *pPlanes = (const dplane_t *)planes.data();
 	const dnode_t *pNodes = (const dnode_t *)nodes.data();
@@ -504,25 +528,57 @@ bool CTLMap::Load( const char *pszGameDir, const char *pszLevel, TLOpenMapFn pfn
 			finish( m_Models.back() );
 		}
 	}
-	// visibility: the world's tree (planes, nodes, each leaf's cluster) + the PVS lump, checked so lookups stay inside
-	if ( nModels > 0 && vis.size() >= 4 )
-	{
-		int nc;
+	// visibility: the world's tree (planes, nodes, each leaf's cluster + area) + the PVS lump + the areas and their
+	// portals, checked so lookups stay inside
+	int nc = 0;
+	if ( vis.size() >= 4 )
 		memcpy( &nc, vis.data(), 4 );
-		if ( nc > 0 && nc < 65536 && (size_t)8 * nc + 4 <= vis.size() )
+	if ( !( nc > 0 && nc < 65536 && (size_t)8 * nc + 4 <= vis.size() ) )
+		nc = 0;
+	const int nAreas = (int)( areas.size() / sizeof( darea_t ) ), nPortals = (int)( areaportals.size() / sizeof( dareaportal_t ) );
+	const bool useAreas = nAreas > 2 && nAreas <= 65536 && nPortals > 0;	// (area 0 = solid; one area = nothing to leave out)
+	if ( nModels > 0 && ( nc || useAreas ) )
+	{
+		m_Planes.resize( nPlanes );
+		for ( int i = 0; i < nPlanes; i++ )
+			m_Planes[i] = { pPlanes[i].normal, pPlanes[i].dist };
+		m_Nodes.resize( nNodes );
+		for ( int i = 0; i < nNodes; i++ )
+			m_Nodes[i] = { pNodes[i].planenum, { pNodes[i].children[0], pNodes[i].children[1] } };
+		m_LeafCluster.resize( nLeafs );
+		m_LeafArea.resize( nLeafs );
+		for ( int i = 0; i < nLeafs; i++ )
 		{
-			m_Planes.resize( nPlanes );
-			for ( int i = 0; i < nPlanes; i++ )
-				m_Planes[i] = { pPlanes[i].normal, pPlanes[i].dist };
-			m_Nodes.resize( nNodes );
-			for ( int i = 0; i < nNodes; i++ )
-				m_Nodes[i] = { pNodes[i].planenum, { pNodes[i].children[0], pNodes[i].children[1] } };
-			m_LeafCluster.resize( nLeafs );
-			for ( int i = 0; i < nLeafs; i++ )
-				memcpy( &m_LeafCluster[i], leafs.data() + (size_t)i * leafSize + 4, 2 );
+			unsigned short areaFlags;	// area = the low 9 bits
+			memcpy( &m_LeafCluster[i], leafs.data() + (size_t)i * leafSize + 4, 2 );
+			memcpy( &areaFlags, leafs.data() + (size_t)i * leafSize + 6, 2 );
+			m_LeafArea[i] = areaFlags & 0x1FF;
+		}
+		if ( nc )
+		{
 			m_Vis.swap( vis );
 			m_nClusters = nc;
-			m_nWorldHead = pModels[0].headnode;
+		}
+		m_nWorldHead = pModels[0].headnode;
+		if ( useAreas )
+		{
+			const darea_t *pAreas = (const darea_t *)areas.data();
+			const dareaportal_t *pPortals = (const dareaportal_t *)areaportals.data();
+			m_Areas.resize( nAreas );
+			for ( int i = 0; i < nAreas; i++ )
+			{
+				const long long first = pAreas[i].firstareaportal, count = pAreas[i].numareaportals;
+				const bool fits = first >= 0 && count >= 0 && first + count <= nPortals;
+				m_Areas[i] = { fits ? (int)first : 0, fits ? (int)count : 0 };
+			}
+			m_Portals.resize( nPortals );
+			for ( int i = 0; i < nPortals; i++ )
+			{
+				const int key = pPortals[i].portalKey;
+				m_Portals[i] = { pPortals[i].otherArea, key >= (int)portalOpen.size() || portalOpen[key] };
+				m_nPortalsShut += !m_Portals[i].open;
+			}
+			m_nPortalsShut /= 2;	// (each portal is listed by both of its areas)
 		}
 	}
 	if ( chops > MAX_CHOPS )
@@ -600,9 +656,10 @@ bool CTLMap::Load( const char *pszGameDir, const char *pszLevel, TLOpenMapFn pfn
 			m_OccFirst.push_back( (int)m_OccVerts.size() );
 	}
 	TL_StrCopy( m_szLevel, pszLevel, sizeof( m_szLevel ) );
-	Msg( "triggerlook: %s: %d teleport, %d booster, %d push, %d gravity, %d other triggers, %d clips (%d sides), %d vis clusters\n", path,
+	Msg( "triggerlook: %s: %d teleport, %d booster, %d push, %d gravity, %d other triggers, %d clips (%d sides), %d vis clusters, "
+		 "%d areas (%d portals closed for good)\n", path,
 		 m_nTriggers[TL_TELEPORT], m_nTriggers[TL_BOOSTER], m_nTriggers[TL_PUSH], m_nTriggers[TL_GRAVITY], m_nTriggers[TL_OTHER],
-		 m_nTriggers[TL_CLIP], m_nPolys, m_nClusters );
+		 m_nTriggers[TL_CLIP], m_nPolys, m_nClusters, (int)m_Areas.size(), m_nPortalsShut );
 	if ( !m_OccFirst.empty() )
 		Msg( "triggerlook: %s: %d surfaces look solid but are drawn see-through (%d materials, first: %s): they hide the triggers behind them\n",
 			 path, (int)m_OccFirst.size() - 1, (int)m_OccMaterials.size(), m_OccMaterials[0].c_str() );
@@ -610,17 +667,22 @@ bool CTLMap::Load( const char *pszGameDir, const char *pszLevel, TLOpenMapFn pfn
 }
 
 // the leaves of the world tree a box reaches -> their clusters (each once); none = drawn whenever in view (also a box
-// over more than MAX_BOX_CLUSTERS: it's everywhere anyway)
-void CTLMap::BoxClusters( const Vector &mins, const Vector &maxs, std::vector<int> &out ) const
+// over more than MAX_BOX_CLUSTERS: it's everywhere anyway); areas = their areas (each once, none = in every area)
+void CTLMap::BoxClusters( const Vector &mins, const Vector &maxs, std::vector<int> &out, std::vector<int> *areas ) const
 {
 	const size_t MAX_BOX_CLUSTERS = 1024;
 	out.clear();
-	if ( !m_nClusters )
+	if ( areas )
+		areas->clear();
+	const bool wantAreas = areas && !m_Areas.empty();
+	if ( !m_nClusters && !wantAreas )
 		return;
 	if ( m_ClusterMark.size() != (size_t)m_nClusters )
 		m_ClusterMark.assign( m_nClusters, 0 );
 	if ( m_NodeMark.size() != m_Nodes.size() )
 		m_NodeMark.assign( m_Nodes.size(), 0 );
+	if ( wantAreas && m_AreaMark.size() != m_Areas.size() )
+		m_AreaMark.assign( m_Areas.size(), 0 );
 	const Vector c = ( mins + maxs ) * 0.5f, e = ( maxs - mins ) * 0.5f;
 	m_Stack.assign( 1, m_nWorldHead );
 	m_Visited.clear();
@@ -636,6 +698,12 @@ void CTLMap::BoxClusters( const Vector &mins, const Vector &maxs, std::vector<in
 			{
 				m_ClusterMark[cl] = 1;
 				out.push_back( cl );
+			}
+			const int a = wantAreas && leaf < (int)m_LeafArea.size() ? m_LeafArea[leaf] : 0;
+			if ( a > 0 && a < (int)m_Areas.size() && !m_AreaMark[a] )
+			{
+				m_AreaMark[a] = 1;
+				areas->push_back( a );
 			}
 			continue;
 		}
@@ -654,13 +722,64 @@ void CTLMap::BoxClusters( const Vector &mins, const Vector &maxs, std::vector<in
 		m_ClusterMark[cl] = 0;
 	for ( int n : m_Visited )
 		m_NodeMark[n] = 0;
+	if ( areas )
+		for ( int a : *areas )
+			m_AreaMark[a] = 0;
 	if ( out.size() > MAX_BOX_CLUSTERS )
+	{
 		out.clear();
+		if ( areas )
+			areas->clear();		// (the walk stopped early: not all of them)
+	}
 }
 
 int CTLMap::PointCluster( const Vector &p ) const
 {
 	if ( !m_nClusters )
+		return -1;
+	int leaf = PointLeaf( p );
+	int cl = leaf >= 0 && leaf < (int)m_LeafCluster.size() ? m_LeafCluster[leaf] : -1;
+	return cl < m_nClusters ? cl : -1;
+}
+
+int CTLMap::PointArea( const Vector &p ) const
+{
+	if ( m_Areas.empty() )
+		return 0;
+	int leaf = PointLeaf( p );
+	return leaf >= 0 && leaf < (int)m_LeafArea.size() ? m_LeafArea[leaf] : 0;
+}
+
+// the areas the game draws from area a (bit per area): a + every area joined to it through portals that aren't
+// closed for good. False = all of them (area 0: in solid / outside the map, like the game; or the map has no areas)
+bool CTLMap::AreaFlood( int area, std::vector<unsigned char> &bits ) const
+{
+	if ( area <= 0 || area >= (int)m_Areas.size() )
+		return false;
+	bits.assign( ( m_Areas.size() + 7 ) / 8, 0 );
+	bits[area >> 3] |= 1 << ( area & 7 );
+	m_Stack.assign( 1, area );
+	while ( !m_Stack.empty() )
+	{
+		const Area_t &ar = m_Areas[m_Stack.back()];
+		m_Stack.pop_back();
+		for ( int k = ar.first; k < ar.first + ar.count; k++ )
+		{
+			const int o = m_Portals[k].other;
+			if ( m_Portals[k].open && o < (int)m_Areas.size() && !( bits[o >> 3] & ( 1 << ( o & 7 ) ) ) )
+			{
+				bits[o >> 3] |= 1 << ( o & 7 );
+				m_Stack.push_back( o );
+			}
+		}
+	}
+	return true;
+}
+
+// the leaf a point is in (-1 = no tree)
+int CTLMap::PointLeaf( const Vector &p ) const
+{
+	if ( m_Nodes.empty() )
 		return -1;
 	int n = m_nWorldHead;
 	for ( int steps = 0; n >= 0 && steps < 4096; steps++ )
@@ -670,11 +789,7 @@ int CTLMap::PointCluster( const Vector &p ) const
 		const Plane_t &pl = m_Planes[m_Nodes[n].plane];
 		n = m_Nodes[n].child[DotProduct( pl.n, p ) - pl.d >= 0 ? 0 : 1];
 	}
-	if ( n >= 0 )
-		return -1;
-	int leaf = -1 - n;
-	int cl = leaf < (int)m_LeafCluster.size() ? m_LeafCluster[leaf] : -1;
-	return cl < m_nClusters ? cl : -1;
+	return n >= 0 ? -1 : -1 - n;
 }
 
 // PVS row of a cluster: run-length coded (a zero byte = that many zero bytes follow)

@@ -84,7 +84,8 @@ Console: `triggerlook_menu`, `triggerlook_show [0/1]`, `triggerlook_enable 0/1` 
   the middle of a side). The border is a band inside each side along its edges.
 - Player clips are the world's brushes with the player clip flag, rebuilt the same way, one per brush.
 - Each frame it draws the triggers that are in view and that the map's own visibility data says can be seen from
-  where you are (the same check the server uses to decide what to send), the sides that face you, in one material
+  where you are (the same check the server uses to decide what to send), leaving out the parts of the map that only
+  join yours through area portals closed for good (the game draws nothing there), the sides that face you, in one material
   with per-vertex colour. Shapes, placement and meshes are built once per map; see-through triggers are ordered back
   to front only where they cover each other on screen; a second view of the same frame (the water refraction view)
   reuses the first. Measured: about 10-20 microseconds per frame with triggers on, nothing with them off.

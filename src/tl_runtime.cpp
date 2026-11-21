@@ -705,7 +705,7 @@ static void BuildOccluders()
 }
 
 // where each model is drawn (once per map): the map's origin / angles keys (most triggers have none), its world box
-struct Place_t { matrix3x4_t xf; bool moved = false; Vector mins, maxs; std::vector<int> clusters; std::vector<Vector> grown; };
+struct Place_t { matrix3x4_t xf; bool moved = false; Vector mins, maxs; std::vector<int> clusters, areas; std::vector<Vector> grown; };
 static std::vector<Place_t> s_Place;
 
 static void PlaceModels()
@@ -724,7 +724,7 @@ static void PlaceModels()
 				p.mins = m->mins;
 				p.maxs = m->maxs;
 			}
-			s_Map.BoxClusters( p.mins - Vector( 1, 1, 1 ), p.maxs + Vector( 1, 1, 1 ), p.clusters );
+			s_Map.BoxClusters( p.mins - Vector( 1, 1, 1 ), p.maxs + Vector( 1, 1, 1 ), p.clusters, &p.areas );
 			TLModel_t g;
 			TL_ExpandModel( *m, TL_DRAW_GROW_X100 / 100.0f, g );	// (what's drawn; picking + custom triggers use the map's own)
 			p.grown.swap( g.verts );
@@ -936,12 +936,14 @@ static void OrderTriggers( const Vector &camera )
 
 static bool s_bPVS = true;					// triggerlook_pvs
 static int s_nCamCluster = -1, s_nPVSCluster = -2, s_nPVSCulled;	// (culled: per cluster)
+static int s_nCamArea = 0, s_nPVSArea = -1, s_nAreaCulled;		// (... + area: closed area portals)
 static std::vector<unsigned char> s_PVS;	// the camera cluster's PVS row
+static std::vector<unsigned char> s_AreaBits;	// the areas drawn from the camera's area (empty = all)
 static std::vector<char> s_ModelSeen;		// by model: the camera cluster can see it (worked out once per cluster)
 static std::vector<int> s_SeenModels;		// ... the list of those
 static VMatrix s_BuiltVP;
 
-CON_COMMAND( triggerlook_pvs, "triggerlook_pvs [0/1]: leave out triggers the map's visibility says can't be seen from here (0 = testing)" )
+CON_COMMAND( triggerlook_pvs, "triggerlook_pvs [0/1]: leave out triggers the map's visibility (and its closed area portals) say can't be seen from here (0 = testing)" )
 {
 	if ( args.ArgC() > 1 )
 		s_bPVS = atoi( args[1] ) != 0;
@@ -1014,11 +1016,18 @@ static void BuildChunks( IMatRenderContext *ctx, const Vector &camera, const Vec
 	const bool cull = s_bCull;
 	// the map's visibility from the camera's cluster (none: in solid / outside / no vis data = everything)
 	s_nCamCluster = s_bPVS ? s_Map.PointCluster( camera ) : -1;
-	if ( s_nCamCluster != s_nPVSCluster || (int)s_ModelSeen.size() != s_Map.NumModels() )
+	// ... and from its area: triggers in areas that only join it through closed area portals aren't drawn (the game
+	// draws nothing there - black - and servers send nothing from there, so !st doesn't show them either)
+	s_nCamArea = s_bPVS ? s_Map.PointArea( camera ) : 0;
+	if ( s_nCamCluster != s_nPVSCluster || s_nCamArea != s_nPVSArea || (int)s_ModelSeen.size() != s_Map.NumModels() )
 	{
 		s_nPVSCluster = s_nCamCluster;
+		s_nPVSArea = s_nCamArea;
 		if ( s_nCamCluster < 0 || !s_Map.ClusterPVS( s_nCamCluster, s_PVS ) )
 			s_PVS.clear();
+		if ( !s_Map.AreaFlood( s_nCamArea, s_AreaBits ) )
+			s_AreaBits.clear();
+		s_nAreaCulled = 0;
 		// each model once for this cluster: in a cluster the camera's can see (a box in no cluster at all: drawn)
 		s_ModelSeen.assign( s_Map.NumModels(), 1 );
 		s_SeenModels.clear();
@@ -1030,6 +1039,15 @@ static void BuildChunks( IMatRenderContext *ctx, const Vector &camera, const Vec
 			bool seen = s_PVS.empty() || cls.empty();
 			for ( size_t k = 0; k < cls.size() && !seen; k++ )
 				seen = ( s_PVS[cls[k] >> 3] & ( 1 << ( cls[k] & 7 ) ) ) != 0;
+			const std::vector<int> &ars = s_Place[mi].areas;	// (none = in every area)
+			if ( seen && !s_AreaBits.empty() && !ars.empty() )
+			{
+				bool joined = false;
+				for ( size_t k = 0; k < ars.size() && !joined; k++ )
+					joined = ( s_AreaBits[ars[k] >> 3] & ( 1 << ( ars[k] & 7 ) ) ) != 0;
+				seen = joined;
+				s_nAreaCulled += !joined;
+			}
 			s_ModelSeen[mi] = seen;
 			if ( seen )
 				s_SeenModels.push_back( mi );
@@ -1324,6 +1342,7 @@ public:
 			PlaceModels();
 			PrebuildMeshes();
 			s_nPVSCluster = -2;		// (the visible list belongs to the old map)
+			s_nPVSArea = -1;
 			s_nHLModel = -1;		// (so does the highlight mesh)
 		}
 		if ( !sameSession )
@@ -1540,8 +1559,10 @@ CON_COMMAND( triggerlook_info, "triggerlook: show what it's doing" )
 	snprintf( line, sizeof( line ), "  custom triggers: %d on this map, %d in all; picking %d, under the crosshair *%d (world at %.0f); menu %s; MOUSE1 = \"%s\"\n",
 				(int)cts.size(), (int)g_TLCT.size(), s_bPicking ? 1 : 0, TL_PickHover(), s_flPickWorld, TLUI_IsOpen() ? "open" : "closed", mouse1 ? mouse1 : "" );
 	out += line;
-	snprintf( line, sizeof( line ), "  last frame: %d triggers drawn, %d sides, %d pairs ordered, %d left out by the map's visibility (camera cluster %d), %d view(s) reusing the first\n",
-				s_nDrawn, s_nDrawnSides, s_nOrderPairs, s_nPVSCulled, s_nCamCluster, s_nReusedLast );
+	snprintf( line, sizeof( line ), "  last frame: %d triggers drawn, %d sides, %d pairs ordered, %d left out by the map's visibility (camera cluster %d), "
+				"%d of them behind closed area portals (camera area %d, %d areas, %d portals closed for good), %d view(s) reusing the first\n",
+				s_nDrawn, s_nDrawnSides, s_nOrderPairs, s_nPVSCulled, s_nCamCluster, s_nAreaCulled, s_nCamArea, (int)s_Map.NumAreas(),
+				s_Map.m_nPortalsShut, s_nReusedLast );
 	out += line;
 	snprintf( line, sizeof( line ), "  solid-looking see-through surfaces hiding triggers: %d (%d triangles in %d meshes)%s%s; depth material %s\n",
 				s_Map.m_OccFirst.empty() ? 0 : (int)s_Map.m_OccFirst.size() - 1, s_nOccTris, (int)s_OccMeshes.size(),
