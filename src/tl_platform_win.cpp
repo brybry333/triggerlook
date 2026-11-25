@@ -8,6 +8,7 @@
 #include <io.h>
 #include <stdlib.h>
 #include <string.h>
+#include <wchar.h>
 
 #include "tl_platform.h"
 
@@ -25,62 +26,224 @@ void *TLP_Interface( const char *module, const char *name )
 	return fn ? fn( name, NULL ) : NULL;
 }
 
+// UTF-8 (our paths; the game folder from the engine may be in the code page) <-> UTF-16 for the wide calls (a user
+// or folder name outside the code page: the A calls can't open it)
+static std::wstring W( const std::string &s )
+{
+	for ( UINT cp : { (UINT)CP_UTF8, (UINT)CP_ACP } )
+	{
+		const DWORD flags = cp == CP_UTF8 ? MB_ERR_INVALID_CHARS : 0;
+		const int n = MultiByteToWideChar( cp, flags, s.c_str(), -1, NULL, 0 );
+		if ( n > 0 )
+		{
+			std::wstring w( n, 0 );
+			MultiByteToWideChar( cp, flags, s.c_str(), -1, &w[0], n );
+			w.resize( n - 1 );
+			return w;
+		}
+	}
+	return L"";
+}
+
+static std::string U( const wchar_t *w )
+{
+	const int n = WideCharToMultiByte( CP_UTF8, 0, w, -1, NULL, 0, NULL, NULL );
+	std::string s( n > 0 ? n : 1, 0 );
+	if ( n > 0 )
+		WideCharToMultiByte( CP_UTF8, 0, w, -1, &s[0], n, NULL, NULL );
+	s.resize( n > 0 ? n - 1 : 0 );
+	return s;
+}
+
+static std::string Slashes( std::string s )
+{
+	for ( char &c : s )
+		if ( c == '\\' )
+			c = '/';
+	return s;
+}
+
 bool TLP_IsFile( const char *path )
 {
-	DWORD a = GetFileAttributesA( path );
+	DWORD a = GetFileAttributesW( W( path ).c_str() );
 	return a != INVALID_FILE_ATTRIBUTES && !( a & FILE_ATTRIBUTE_DIRECTORY );
 }
 
-bool TLP_ListDir( const char *dir, void ( *fn )( const char *name, void *ctx ), void *ctx )
+bool TLP_IsDir( const std::string &path )
 {
-	char pattern[1024];
-	snprintf( pattern, sizeof( pattern ), "%s\\*", dir );
-	WIN32_FIND_DATAA fd;
-	HANDLE h = FindFirstFileA( pattern, &fd );
+	DWORD a = GetFileAttributesW( W( path ).c_str() );
+	return a != INVALID_FILE_ATTRIBUTES && ( a & FILE_ATTRIBUTE_DIRECTORY );
+}
+
+bool TLP_Remove( const char *path ) { return DeleteFileW( W( path ).c_str() ) != 0; }
+
+static long long UnixTime( const FILETIME &ft )
+{
+	ULARGE_INTEGER t;
+	t.LowPart = ft.dwLowDateTime;
+	t.HighPart = ft.dwHighDateTime;
+	return (long long)( t.QuadPart / 10000000ULL ) - 11644473600LL;
+}
+
+long long TLP_MTime( const std::string &path )
+{
+	WIN32_FILE_ATTRIBUTE_DATA a;
+	return GetFileAttributesExW( W( path ).c_str(), GetFileExInfoStandard, &a ) ? UnixTime( a.ftLastWriteTime ) : -1;
+}
+
+bool TLP_List( const std::string &dir, std::vector<TLPEntry_t> &out )
+{
+	out.clear();
+	if ( dir.empty() )
+	{
+		// above a drive's root: the drives
+		const DWORD drives = GetLogicalDrives();
+		for ( int i = 0; i < 26; i++ )
+			if ( drives & ( 1u << i ) )
+				out.push_back( { std::string( 1, (char)( 'A' + i ) ) + ":", true, 0 } );
+		return true;
+	}
+	WIN32_FIND_DATAW fd;
+	HANDLE h = FindFirstFileW( W( dir + ( dir.back() == '/' || dir.back() == '\\' ? "*" : "/*" ) ).c_str(), &fd );
 	if ( h == INVALID_HANDLE_VALUE )
 		return false;
 	do
 	{
-		if ( fd.cFileName[0] != '.' )
-			fn( fd.cFileName, ctx );
-	} while ( FindNextFileA( h, &fd ) );
+		if ( fd.cFileName[0] != L'.' )
+			out.push_back( { U( fd.cFileName ), ( fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY ) != 0, UnixTime( fd.ftLastWriteTime ) } );
+	} while ( FindNextFileW( h, &fd ) );
 	FindClose( h );
 	return true;
 }
 
-static const char *OwnDir( char *buf, size_t len, const char *env, const char *fallback )
+std::string TLP_Home()
+{
+	const wchar_t *h = _wgetenv( L"USERPROFILE" );
+	return h && h[0] ? Slashes( U( h ) ) : "C:/";
+}
+
+// "C:/..." -> "C:/"; above it there's "" (the drives)
+std::string TLP_Root( const std::string &path ) { return path.size() >= 2 && path[1] == ':' ? path.substr( 0, 2 ) + "/" : ""; }
+
+std::string TLP_FindMareTF()
+{
+	wchar_t buf[MAX_PATH];
+	HMODULE self = NULL;
+	GetModuleHandleExW( GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCWSTR)(void *)&TLP_FindMareTF, &self );
+	const DWORD n = GetModuleFileNameW( self, buf, MAX_PATH );
+	buf[n < MAX_PATH ? n : MAX_PATH - 1] = 0;
+	std::string p = Slashes( U( buf ) );
+	p = p.substr( 0, p.rfind( '/' ) + 1 ) + "maretf.exe";
+	if ( TLP_IsFile( p.c_str() ) )
+		return p;
+	return SearchPathW( NULL, L"maretf.exe", NULL, MAX_PATH, buf, NULL ) ? Slashes( U( buf ) ) : "";
+}
+
+// one command-line argument the way CommandLineToArgvW / the CRT read it back
+static void Quote( std::string &cmd, const std::string &a )
+{
+	cmd += '"';
+	int slashes = 0;
+	for ( char c : a )
+	{
+		if ( c == '\\' )
+			slashes++;
+		else
+		{
+			if ( c == '"' )
+				cmd.append( slashes + 1, '\\' );
+			slashes = 0;
+		}
+		cmd += c;
+	}
+	cmd.append( slashes, '\\' );
+	cmd += "\" ";
+}
+
+int TLP_Run( const std::string &exe, const std::vector<std::string> &args, const std::string &log, int timeout )
+{
+	std::string cmd;
+	Quote( cmd, exe );
+	for ( const std::string &a : args )
+		Quote( cmd, a );
+	std::wstring wcmd = W( cmd );
+	SECURITY_ATTRIBUTES sa = { sizeof( sa ), NULL, TRUE };
+	HANDLE out = CreateFileW( W( log ).c_str(), FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, &sa, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL );
+	STARTUPINFOW si = { sizeof( si ) };
+	si.dwFlags = STARTF_USESTDHANDLES;
+	si.hStdOutput = si.hStdError = out;
+	PROCESS_INFORMATION pi;
+	const BOOL ok = CreateProcessW( NULL, &wcmd[0], NULL, NULL, TRUE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi );
+	if ( out != INVALID_HANDLE_VALUE )
+		CloseHandle( out );
+	if ( !ok )
+		return 1;
+	int result = 1;
+	if ( WaitForSingleObject( pi.hProcess, (DWORD)timeout * 1000 ) == WAIT_TIMEOUT )
+	{
+		TerminateProcess( pi.hProcess, 1 );
+		WaitForSingleObject( pi.hProcess, INFINITE );
+		result = 2;
+	}
+	else
+	{
+		DWORD code = 1;
+		GetExitCodeProcess( pi.hProcess, &code );
+		result = code == 0 ? 0 : 1;
+	}
+	CloseHandle( pi.hProcess );
+	CloseHandle( pi.hThread );
+	return result;
+}
+
+struct Thread_t { void ( *fn )( void * ); void *arg; };
+static DWORD WINAPI ThreadMain( LPVOID p )
+{
+	Thread_t t = *(Thread_t *)p;
+	delete (Thread_t *)p;
+	t.fn( t.arg );
+	return 0;
+}
+
+bool TLP_StartThread( void ( *fn )( void * ), void *arg )
+{
+	Thread_t *t = new Thread_t{ fn, arg };
+	HANDLE h = CreateThread( NULL, 0, ThreadMain, t, 0, NULL );
+	if ( !h )
+		delete t;
+	else
+		CloseHandle( h );
+	return h != NULL;
+}
+
+static const char *OwnDir( char *buf, size_t len, const wchar_t *env )
 {
 	if ( !buf[0] )
 	{
-		const char *base = getenv( env );
-		snprintf( buf, len, "%s/triggerlook", base && base[0] ? base : fallback );
-		CreateDirectoryA( buf, NULL );
+		const wchar_t *base = _wgetenv( env );
+		wchar_t dir[1024];
+		swprintf( dir, 1024, L"%ls/triggerlook", base && base[0] ? base : L"." );
+		CreateDirectoryW( dir, NULL );
+		if ( !WideCharToMultiByte( CP_UTF8, 0, dir, -1, buf, (int)len, NULL, NULL ) )
+			buf[0] = 0;
 	}
 	return buf;
 }
 
-const char *TLP_ConfigDir() { static char s[1024]; return OwnDir( s, sizeof( s ), "APPDATA", "." ); }
-const char *TLP_CacheDir() { static char s[1024]; return OwnDir( s, sizeof( s ), "TEMP", "." ); }
+const char *TLP_ConfigDir() { static char s[1024]; return OwnDir( s, sizeof( s ), L"APPDATA" ); }
+const char *TLP_CacheDir() { static char s[1024]; return OwnDir( s, sizeof( s ), L"TEMP" ); }
+
+FILE *TLP_Open( const char *path, const char *mode ) { return _wfopen( W( path ).c_str(), W( mode ).c_str() ); }
 
 void TLP_MakeDirs( const char *dir )
 {
-	char p[1024];
-	snprintf( p, sizeof( p ), "%s", dir );
-	for ( char *s = p + 1; *s; s++ )
-		if ( ( *s == '/' || *s == '\\' ) && s[-1] != ':' )
-		{
-			char c = *s;
-			*s = 0;
-			CreateDirectoryA( p, NULL );
-			*s = c;
-		}
-	CreateDirectoryA( p, NULL );
+	const std::string p = dir;
+	for ( size_t i = 1; i <= p.size(); i++ )
+		if ( i == p.size() || ( ( p[i] == '/' || p[i] == '\\' ) && p[i - 1] != ':' ) )
+			CreateDirectoryW( W( p.substr( 0, i ) ).c_str(), NULL );
 }
 
-bool TLP_ReplaceFile( const char *tmp, const char *path )
-{
-	return MoveFileExA( tmp, path, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH ) != 0;
-}
+bool TLP_ReplaceFile( const char *tmp, const char *path ) { return MoveFileExW( W( tmp ).c_str(), W( path ).c_str(), MOVEFILE_REPLACE_EXISTING ) != 0; }
 
 bool TLP_Seek( FILE *f, long long ofs ) { return _fseeki64( f, ofs, SEEK_SET ) == 0; }
 

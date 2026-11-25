@@ -4,6 +4,7 @@
 #ifndef TL_UI_H
 #define TL_UI_H
 
+#include <string>
 #include <vector>
 
 class IVEngineClient;
@@ -18,6 +19,7 @@ bool TLUI_IsOpen();
 void TL_Tick();
 int TL_InMap( int type );		// this map's triggers (or clips) of a type
 bool TL_Active();		// triggerlook_enable and in game with the map read
+void TL_ReadMap();		// read the map now if triggers OFF skipped it (the menu opening)
 void TL_Start();		// panels up as soon as VGUI is (no-op once done)
 void TL_RunScript();	// tl_ui.cpp: the next due lines of a triggerlook_selftest script
 
@@ -33,5 +35,6 @@ int TL_PickHover();					// its model number, -1 = none
 int TL_ModelCT( int model );			// trigger *model's custom trigger, -1 = none
 int TL_PickedCT( int model );		// that trigger's custom trigger (made from its type's look if it has none), -1 = none
 void TLUI_Tick();					// tl_ui.cpp: from TL_Tick
+std::string TL_PlayerSpray();		// the player's own spray (cl_logofile "materials/vgui/logos/cat.vtf" -> "cat"), "" = none
 
 #endif // TL_UI_H

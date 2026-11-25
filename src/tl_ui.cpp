@@ -4,12 +4,16 @@
 //
 //   ON / OFF next to the title: draw this map's triggers at all (read from the map file, no server command);
 //            OFF = the game's own trigger look. Also triggerlook_show (bindable).
-//   SHOW     one button per trigger type (and CLIPS, the map's player clips): white = drawn, grey = hidden
+//   SHOW     one button per trigger type (and CLIPS, INVISIBLES, NODRAWS: the map's player clips, invisible walls and
+//            nodraw sides), two rows of four: white = drawn, grey = hidden
 //   EDIT     the same types, each in its own colours (fill inside, border round it); the colour settings below
 //            change the picked ones (click = only that one, shift + click = add / remove)
 //   CUSTOM TRIGGERS  SELECT TRIGGER = pick one trigger in the world: it gets its own look (CT-1, CT-2, ... on this
 //            map), picked with the types like another EDIT button; DELETE = the picked ones back to their type's look
 //   FILL / BORDER  which part the colours and OPACITY change; WIDTH = the border's width (OFF = none)
+//   SKYBOX   OFF / COLOUR / SPRAY / PICTURE in place of the map's sky (every map, ON / OFF or not): its page has the
+//            colour blocks + CUSTOM COLOUR, this PC's sprays, or the pictures added with ADD A FILE (an in-game file
+//            list: the system's file dialog would open behind a fullscreen game)
 //
 // Changes show at once on the triggers in front of you (the menu sits at the left and doesn't darken the game).
 // Plain VGUI panels of the client, input polled (VGUI messages are KeyValues in the game's newer layout). Esc closes.
@@ -37,6 +41,7 @@
 #include "inputsystem/iinputsystem.h"
 
 #include "tl_look.h"
+#include "tl_pics.h"
 #include "tl_ui.h"
 #include "tl_platform.h"
 #include "tl_util.h"
@@ -451,7 +456,56 @@ static std::vector<TypeKey_t> TypeKeys()
 static void SetMenuOpen( bool open );
 static void StartPick();
 
-enum { VIEW_MAIN, VIEW_CUSTOM };
+// the start of a long text cut off ("...folder/file") so its end shows
+static std::string FitLeft( int f, const std::string &s, int w )
+{
+	for ( size_t n = 0; n < s.size(); n++ )
+	{
+		std::string t = ( n ? "..." : "" ) + s.substr( n );
+		if ( TextW( f, t.c_str() ) <= w )
+			return t;
+	}
+	return "...";
+}
+
+// a sky picture's / spray's thumbnail: its material as a VGUI texture (one each, kept)
+static void Thumb( const TLPic_t &p, int x, int y, int size )
+{
+	static std::vector<std::pair<std::string, int> > s_Ids;
+	int id = 0;
+	for ( const auto &t : s_Ids )
+		if ( t.first == p.material )
+			id = t.second;
+	if ( !id )
+	{
+		id = s_pSurface->CreateNewTextureID( false );
+		s_pSurface->DrawSetTextureFile( id, p.material.c_str(), true, false );
+		s_Ids.push_back( { p.material, id } );
+	}
+	Rect( x, y, size, size, { 36, 34, 40, 255 } );
+	const float a = p.aspect;
+	const int w = a >= 1 ? size : (int)( size * a ), h = a >= 1 ? (int)( size / a ) : size;
+	s_pSurface->DrawSetTexture( id );
+	s_pSurface->DrawSetColor( 255, 255, 255, 255 );
+	s_pSurface->DrawTexturedRect( x + ( size - w ) / 2, y + ( size - h ) / 2, x + ( size + w ) / 2, y + ( size + h ) / 2 );
+}
+
+// the folder ADD A FILE opened last
+static std::string LastDirFile() { return std::string( TLP_CacheDir() ) + "/lastdir.txt"; }
+static std::string LastDir()
+{
+	char buf[1024] = "";
+	if ( FILE *f = TLP_Open( LastDirFile().c_str(), "r" ) )
+	{
+		if ( !fgets( buf, sizeof( buf ), f ) )
+			buf[0] = 0;
+		fclose( f );
+	}
+	buf[strcspn( buf, "\r\n" )] = 0;
+	return buf;
+}
+
+enum { VIEW_MAIN, VIEW_CUSTOM, VIEW_SKY, VIEW_FILES };
 enum { PART_FILL, PART_BORDER };
 
 static const int PAGE_W = 576;		// the content width at 1080p (the paint menu's)
@@ -499,7 +553,16 @@ public:
 		ValidateSel();
 	}
 	void SetPart( int part ) { m_nPart = part; }
-	void SetView( int view ) { if ( view == VIEW_CUSTOM ) StartCustom(); m_nView = view; }
+	void SetView( int view )
+	{
+		if ( view == VIEW_CUSTOM )
+			StartCustom();
+		if ( view == VIEW_SKY )
+			OpenSky( g_TLSky.mode );
+		if ( view == VIEW_FILES )
+			OpenFiles();
+		m_nView = view;
+	}
 
 	// Esc: the engine opens its pause menu on Esc before VGUI sees the key (same as the paint menu)
 	virtual void OnTick()
@@ -581,7 +644,8 @@ public:
 		const int W = S( PAGE_W ) + 2 * pad, H = S( 54 ) + ContentH( m_nCTRows ) + pad;
 		int x0 = S( 48 ), y0 = ( sh - H ) / 2;
 		PixelBox( x0, y0, W, H, MAX( 2, S( 4 ) ), C_BG, C_WOOD_DARK );
-		Text( F_TITLE, x0 + pad, y0 + S( 14 ), C_WOOD_LIGHT, m_nView == VIEW_CUSTOM ? "CUSTOM COLOUR" : "TRIGGERS" );
+		static const char *const s_Titles[] = { "TRIGGERS", "CUSTOM COLOUR", "SKYBOX", "ADD A FILE" };
+		Text( F_TITLE, x0 + pad, y0 + S( 14 ), C_WOOD_LIGHT, s_Titles[m_nView] );
 		if ( Button( x0 + W - pad - S( 32 ), y0 + S( 12 ), S( 32 ), S( 28 ), "X" ) )
 		{
 			SetMenuOpen( false );
@@ -589,7 +653,7 @@ public:
 		}
 		if ( m_nView != VIEW_MAIN && Button( x0 + W - pad - S( 32 ) - S( 8 ) - S( 84 ), y0 + S( 12 ), S( 84 ), S( 28 ), "BACK" ) )
 		{
-			m_nView = VIEW_MAIN;
+			m_nView = m_nView == VIEW_FILES || ( m_nView == VIEW_CUSTOM && m_bSkyColour ) ? VIEW_SKY : VIEW_MAIN;
 			s_bClick = false;
 		}
 		// ON / OFF: draw the map's triggers at all
@@ -602,6 +666,10 @@ public:
 		int cx = x0 + pad, cy = y0 + S( 54 ), cw = W - 2 * pad;
 		if ( m_nView == VIEW_CUSTOM )
 			CustomView( cx, cy, cw );
+		else if ( m_nView == VIEW_SKY )
+			SkyView( cx, cy, cw, ContentH( m_nCTRows ) );
+		else if ( m_nView == VIEW_FILES )
+			FilesView( cx, cy, cw, ContentH( m_nCTRows ) );
 		else
 			MainView( cx, cy, cw );
 	}
@@ -630,11 +698,27 @@ private:
 	enum { SV_CELLS = 24, HUE_CELLS = 24 };
 	int m_nHue = 0, m_nSat = 0, m_nVal = 0;
 	bool m_bGreys = false;
+	bool m_bSkyColour = false;			// the picker edits the sky's colour (opened from the SKYBOX page)
+	// SKYBOX page: the list shown (TL_SKY_*), scrolled by rows; ADD A FILE's folder and what's in it
+	int m_nSkyTab = TL_SKY_COLOUR, m_nSkyScroll = 0, m_nFileScroll = 0;
+	std::string m_Dir;
+	std::vector<TLDirEntry_t> m_Entries;
 
-	// the same height on both pages
+	// the same height on every page: SHOW + EDIT (two rows of 4 types each), CUSTOM TRIGGERS, FILL / BORDER, colours,
+	// CUSTOM, the sliders, SKYBOX, the line at the bottom
 	int ContentH( int ctRows ) const
 	{
-		return S( 22 + 42 + 14 ) * 3 + ctRows * S( 52 ) + S( 42 + 14 ) + S( 22 + 2 * 80 ) + S( 22 + 70 + 14 ) + S( 22 + 28 + 14 ) + S( 22 );
+		return S( 22 + 80 + 14 ) * 2 + S( 22 + 42 + 14 ) + ctRows * S( 52 ) + S( 42 + 14 ) + S( 22 + 2 * 80 ) + S( 22 + 70 + 14 ) +
+			   S( 22 + 28 + 14 ) + S( 22 + 42 + 14 ) + S( 22 );
+	}
+	// type t's button in a grid of 4 per row
+	void TypeRect( int x, int y, int w, int t, int &bx, int &by, int &bw, int &bh ) const
+	{
+		const int gap = S( 10 );
+		bw = ( w - 3 * gap ) / 4;
+		bh = S( 36 );
+		bx = x + ( t % 4 ) * ( bw + gap );
+		by = y + ( t / 4 ) * ( bh + S( 8 ) );
 	}
 
 	bool CTPicked( int index ) const { return std::find( m_SelCT.begin(), m_SelCT.end(), index ) != m_SelCT.end(); }
@@ -873,8 +957,8 @@ private:
 	// ---- the main page ----------------------------------------------------------------------------------
 	void MainView( int x, int y, int w )
 	{
-		const int gap = S( 10 ), label = S( 22 ), bh = S( 42 ), tbw = ( w - ( TL_TYPES - 1 ) * gap ) / TL_TYPES, hw = ( w - gap ) / 2;
-		int cy = y;
+		const int gap = S( 10 ), label = S( 22 ), bh = S( 42 ), hw = ( w - gap ) / 2;
+		int cy = y, bx, by, tbw, tbh;
 		m_nHover = m_nHoverCT = -1;
 
 		// SHOW: white = drawn, grey = hidden
@@ -882,16 +966,16 @@ private:
 		cy += label;
 		for ( int t = 0; t < TL_TYPES; t++ )
 		{
-			int bx = x + t * ( tbw + gap );
-			if ( ShowButton( bx, cy, tbw, bh, g_TLTypeLabel[t], g_TLLook[t].show ) )
+			TypeRect( x, cy, w, t, bx, by, tbw, tbh );
+			if ( ShowButton( bx, by, tbw, tbh, g_TLTypeLabel[t], g_TLLook[t].show ) )
 			{
 				g_TLLook[t].show = !g_TLLook[t].show;
 				TL_LookChanged( 0 );	// (drawn or not: no mesh change)
 			}
-			if ( Hover( bx, cy, tbw, bh ) )
+			if ( Hover( bx, by, tbw, tbh ) )
 				m_nHover = t;
 		}
-		cy += bh + S( 14 );
+		cy += S( 80 + 14 );
 
 		// EDIT: each type in its own colours; the settings below change the picked ones
 		Text( F_BOLD, x, cy, C_WOOD, "EDIT" );
@@ -900,13 +984,13 @@ private:
 		cy += label;
 		for ( int t = 0; t < TL_TYPES; t++ )
 		{
-			int bx = x + t * ( tbw + gap );
-			if ( ItemButton( bx, cy, tbw, bh, g_TLLook[t], g_TLTypeLabel[t], ( m_nSel & ( 1 << t ) ) != 0 ) )
+			TypeRect( x, cy, w, t, bx, by, tbw, tbh );
+			if ( ItemButton( bx, by, tbw, tbh, g_TLLook[t], g_TLTypeLabel[t], ( m_nSel & ( 1 << t ) ) != 0 ) )
 				ClickItem( 1 << t, -1 );
-			if ( Hover( bx, cy, tbw, bh ) )
+			if ( Hover( bx, by, tbw, tbh ) )
 				m_nHover = t;
 		}
-		cy += bh + S( 14 );
+		cy += S( 80 + 14 );
 
 		// CUSTOM TRIGGERS: SELECT TRIGGER picks one in the world (CT-1, CT-2, ... in the order picked); their buttons
 		// are picked like the EDIT ones; DELETE = the picked ones get their type's look again
@@ -991,6 +1075,7 @@ private:
 		int px = x + thumb + gap;
 		if ( Button( px, cy + ( thumb - bh ) / 2, x + w - px, bh, "CUSTOM COLOUR" ) )
 		{
+			m_bSkyColour = false;
 			StartCustom();
 			m_nView = VIEW_CUSTOM;
 			s_bClick = false;
@@ -1031,6 +1116,14 @@ private:
 		}
 		cy += S( 28 ) + S( 14 );
 
+		// SKYBOX: what's in place of the map's sky (its page picks the colour / spray / picture)
+		Text( F_BOLD, x, cy, C_WOOD, "SKYBOX" );
+		const std::string now = SkyText();
+		Text( F_SMALL, x + w - TextW( F_SMALL, now.c_str() ), cy + ( TextH( F_BOLD ) - TextH( F_SMALL ) ) / 2, C_SUB, now.c_str() );
+		cy += label;
+		SkyModes( x, cy, w );
+		cy += bh + S( 14 );
+
 		// the line at the bottom: why nothing shows, else what the type / custom trigger under the cursor (or the
 		// first picked) has
 		char line[256];
@@ -1040,10 +1133,10 @@ private:
 		if ( m_nRename >= 0 )
 			snprintf( line, sizeof( line ), "type a name (up to %d)  \xC2\xB7  Enter: done  \xC2\xB7  Esc: keep the old one  \xC2\xB7  empty = CT-%d",
 						(int)TL_NAME_MAX, TL_CTLabel( m_nRename ) );
-		else if ( !TL_Active() )
-			TL_StrCopy( line, "off: triggerlook_enable is 0 (the game's own trigger look)", sizeof( line ) );
 		else if ( !g_bTLShow )
 			TL_StrCopy( line, "OFF: click ON at the top to draw this map's triggers (or bind a key to triggerlook_show)", sizeof( line ) );
+		else if ( !TL_Active() )
+			TL_StrCopy( line, "off: triggerlook_enable is 0 (the game's own trigger look)", sizeof( line ) );
 		else if ( !inMap )
 			TL_StrCopy( line, "this map has no triggers or clips", sizeof( line ) );
 		else
@@ -1103,7 +1196,7 @@ private:
 	// ---- custom colour: the paint menu's picker; every change shows on the triggers at once --------------
 	void StartCustom()
 	{
-		const unsigned char *c = Part( FirstLook() );
+		const unsigned char *c = m_bSkyColour ? g_TLSky.rgb : Part( FirstLook() );
 		int rgb[3] = { c[0], c[1], c[2] };
 		float hh, ss, vv;
 		RgbToHsv( rgb, &hh, &ss, &vv );
@@ -1172,7 +1265,10 @@ private:
 		PickedRGB( rgb );
 		if ( rgb[0] != before[0] || rgb[1] != before[1] || rgb[2] != before[2] )
 		{
-			ApplyRGB( rgb[0], rgb[1], rgb[2] );
+			if ( m_bSkyColour )
+				SetSkyColour( rgb[0], rgb[1], rgb[2] );
+			else
+				ApplyRGB( rgb[0], rgb[1], rgb[2] );
 			g_TLCustom[0] = rgb[0]; g_TLCustom[1] = rgb[1]; g_TLCustom[2] = rgb[2];
 			TL_LookChanged( 0 );
 		}
@@ -1186,23 +1282,273 @@ private:
 		Text( F_BOLD, rx, y + S( 124 ), C_TEXT, hex );
 		snprintf( hex, sizeof( hex ), "%d %d %d", rgb[0], rgb[1], rgb[2] );
 		Text( F_SMALL, rx, y + S( 124 ) + TextH( F_BOLD ) + S( 4 ), C_SUB, hex );
-		std::string on = m_nPart == PART_FILL ? "FILL OF" : "BORDER OF";
+		std::string on = m_bSkyColour ? "THE SKYBOX" : m_nPart == PART_FILL ? "FILL OF" : "BORDER OF";
 		int ly = y + S( 124 ) + TextH( F_BOLD ) + TextH( F_SMALL ) + S( 18 );
 		Text( F_SMALL, rx, ly, C_SUB, on.c_str() );
-		for ( int t = 0; t < TL_TYPES; t++ )
+		for ( int t = 0; t < TL_TYPES && !m_bSkyColour; t++ )
 			if ( ( m_nSel & ( 1 << t ) ) && ly + 2 * ( TextH( F_SMALL ) + S( 2 ) ) < y + sv - S( 42 ) )
 			{
 				ly += TextH( F_SMALL ) + S( 2 );
 				Text( F_SMALL, rx, ly, C_TEXT, g_TLTypeLabel[t] );
 			}
 		// (as many custom triggers as fit above DONE)
-		for ( size_t k = 0; k < m_SelCT.size() && ly + 2 * ( TextH( F_SMALL ) + S( 2 ) ) < y + sv - S( 42 ); k++ )
+		for ( size_t k = 0; k < m_SelCT.size() && !m_bSkyColour && ly + 2 * ( TextH( F_SMALL ) + S( 2 ) ) < y + sv - S( 42 ); k++ )
 		{
 			ly += TextH( F_SMALL ) + S( 2 );
 			Text( F_SMALL, rx, ly, C_TEXT, CTName( m_SelCT[k] ).c_str() );
 		}
 		if ( Button( rx, y + sv - S( 42 ), rw, S( 42 ), "DONE" ) )
-			m_nView = VIEW_MAIN;
+			m_nView = m_bSkyColour ? VIEW_SKY : VIEW_MAIN;
+	}
+
+	// ---- the skybox ------------------------------------------------------------------------------------
+	static void SetSkyColour( int r, int g, int b )
+	{
+		g_TLSky.mode = TL_SKY_COLOUR;
+		g_TLSky.rgb[0] = (unsigned char)r; g_TLSky.rgb[1] = (unsigned char)g; g_TLSky.rgb[2] = (unsigned char)b;
+		TL_SkyChanged();
+	}
+
+	// "colour #RRGGBB", "spray cat", ...
+	static std::string SkyText()
+	{
+		char t[96];
+		const TLSky_t &k = g_TLSky;
+		if ( k.mode == TL_SKY_COLOUR )
+			snprintf( t, sizeof( t ), "colour #%02X%02X%02X, every map", k.rgb[0], k.rgb[1], k.rgb[2] );
+		else if ( k.mode == TL_SKY_OFF )
+			TL_StrCopy( t, "off: the map's own sky", sizeof( t ) );
+		else
+			snprintf( t, sizeof( t ), "%s %s, every map", k.mode == TL_SKY_SPRAY ? "spray" : "picture", ( k.mode == TL_SKY_SPRAY ? k.spray : k.picture ).c_str() );
+		return t;
+	}
+
+	// a mode picked (main page or the SKYBOX page): it shows at once (the last colour / spray / picture, at first your
+	// own spray / the first picture) and its page opens
+	void OpenSky( int mode )
+	{
+		TLPics_Refresh();
+		TLSky_t &k = g_TLSky;
+		if ( mode == TL_SKY_SPRAY && !TLPics_Find( true, k.spray ) )
+			k.spray = TLPics_Find( true, TL_PlayerSpray() ) ? TL_PlayerSpray() : TLPics_List( true ).empty() ? "" : TLPics_List( true )[0].name;
+		if ( mode == TL_SKY_PICTURE && !TLPics_Find( false, k.picture ) )
+			k.picture = TLPics_List( false ).empty() ? "" : TLPics_List( false )[0].name;
+		if ( mode != TL_SKY_SPRAY && mode != TL_SKY_PICTURE ? mode != k.mode : !( mode == TL_SKY_SPRAY ? k.spray : k.picture ).empty() )
+		{
+			k.mode = mode;
+			TL_SkyChanged();
+		}
+		if ( mode != TL_SKY_OFF )
+			m_nSkyTab = mode;
+		m_nSkyScroll = 0;
+	}
+
+	// OFF | COLOUR | SPRAY | PICTURE (the one shown is lit)
+	void SkyModes( int x, int y, int w )
+	{
+		static const char *const s_Labels[] = { "OFF", "COLOUR", "SPRAY", "PICTURE" };
+		const int gap = S( 10 ), bw = ( w - 3 * gap ) / 4;
+		for ( int k = 0; k < 4; k++ )
+			if ( Button( x + k * ( bw + gap ), y, bw, S( 42 ), s_Labels[k], g_TLSky.mode == k ) )
+			{
+				OpenSky( k );
+				if ( k != TL_SKY_OFF )
+					m_nView = VIEW_SKY;
+				s_bClick = false;
+			}
+	}
+
+	void SkyView( int x, int y, int w, int h )
+	{
+		const int gap = S( 10 ), label = S( 22 ), bottom = y + h - S( 22 );
+		SkyModes( x, y, w );
+		int cy = y + S( 42 + 14 );
+		std::string line;
+		if ( m_nSkyTab == TL_SKY_COLOUR )
+		{
+			// the paint menu's colour blocks, your custom colour and the picker: the sky changes at once
+			const int thumb = S( 70 ), perRow = 7;
+			Text( F_BOLD, x, cy, C_WOOD, "COLOUR" );
+			cy += label;
+			for ( int i = 0; i < 14; i++ )
+			{
+				const Preset_t &pr = s_Presets[i];
+				const int tx = x + ( i % perRow ) * ( thumb + gap ), ty = cy + ( i / perRow ) * ( thumb + gap );
+				const bool sel = g_TLSky.mode == TL_SKY_COLOUR && g_TLSky.rgb[0] == pr.r && g_TLSky.rgb[1] == pr.g && g_TLSky.rgb[2] == pr.b;
+				if ( Swatch( tx, ty, thumb, { pr.r, pr.g, pr.b, 255 }, sel ) )
+					SetSkyColour( pr.r, pr.g, pr.b );
+			}
+			cy += 2 * ( thumb + gap );
+			Text( F_BOLD, x, cy, C_WOOD, "CUSTOM" );
+			cy += label;
+			const int *c = g_TLCustom;
+			if ( Swatch( x, cy, thumb, { c[0], c[1], c[2], 255 }, g_TLSky.mode == TL_SKY_COLOUR && g_TLSky.rgb[0] == c[0] && g_TLSky.rgb[1] == c[1] && g_TLSky.rgb[2] == c[2] ) )
+				SetSkyColour( c[0], c[1], c[2] );
+			if ( Button( x + thumb + gap, cy + ( thumb - S( 42 ) ) / 2, w - thumb - gap, S( 42 ), "CUSTOM COLOUR" ) )
+			{
+				m_bSkyColour = true;
+				StartCustom();
+				m_nView = VIEW_CUSTOM;
+				s_bClick = false;
+			}
+			line = SkyText();
+		}
+		else
+		{
+			// SPRAY: this PC's sprays (yours marked); PICTURE: the pictures added + ADD A FILE
+			const bool spray = m_nSkyTab == TL_SKY_SPRAY;
+			if ( !spray )
+			{
+				const TLPicStatus_t st = TLPics_Status();
+				if ( Button( x, cy, S( 190 ), S( 36 ), st.state == 1 ? "ADDING..." : "+ ADD A FILE", false, st.state != 1 ) )
+				{
+					OpenFiles();
+					m_nView = VIEW_FILES;
+					s_bClick = false;
+					return;
+				}
+				if ( st.state )
+					Text( F_SMALL, x + S( 204 ), cy + ( S( 36 ) - TextH( F_SMALL ) ) / 2, st.state == 3 ? Col{ 230, 90, 80, 255 } : st.state == 2 ? C_WOOD_LIGHT : C_SUB,
+						  FitRight( F_SMALL, st.text, w - S( 204 ) ).c_str() );
+				cy += S( 36 + 14 );
+			}
+			const std::vector<TLPic_t> &list = TLPics_List( spray );
+			const int thumb = S( 70 ), perRow = MAX( 1, ( w + gap ) / ( thumb + gap ) ), rows = ( (int)list.size() + perRow - 1 ) / perRow;
+			const int shown = MAX( 1, ( bottom - cy - label ) / ( thumb + gap ) );
+			Text( F_BOLD, x, cy, C_WOOD, spray ? "SPRAYS ON THIS PC" : "PICTURES" );
+			if ( rows > shown )
+				Text( F_SMALL, x + w - TextW( F_SMALL, "wheel = more" ), cy + ( TextH( F_BOLD ) - TextH( F_SMALL ) ) / 2, C_SUB, "wheel = more" );
+			cy += label;
+			if ( Hover( x, cy, w, bottom - cy ) && s_nWheel )
+				m_nSkyScroll -= s_nWheel;
+			m_nSkyScroll = clamp( m_nSkyScroll, 0, MAX( 0, rows - shown ) );
+			if ( list.empty() )
+				Text( F_SMALL, x, cy, C_SUB, spray ? "no sprays in materials/vgui/logos" : "none yet: ADD A FILE turns a JPEG, PNG, GIF, WEBP or VTF into one" );
+			const std::string &picked = spray ? g_TLSky.spray : g_TLSky.picture, mine = TL_PlayerSpray();
+			const TLPic_t *hover = NULL;
+			for ( int i = m_nSkyScroll * perRow; i < (int)list.size() && i < ( m_nSkyScroll + shown ) * perRow; i++ )
+			{
+				const TLPic_t &p = list[i];
+				const int tx = x + ( i % perRow ) * ( thumb + gap ), ty = cy + ( i / perRow - m_nSkyScroll ) * ( thumb + gap );
+				Thumb( p, tx, ty, thumb );
+				if ( spray && !TL_StrICmp( p.name.c_str(), mine.c_str() ) )
+				{
+					Rect( tx, ty, TextW( F_SMALL, "YOURS" ) + S( 8 ), TextH( F_SMALL ) + S( 2 ), C_WOOD );
+					Text( F_SMALL, tx + S( 4 ), ty + S( 1 ), C_BLACK, "YOURS" );
+				}
+				const bool sel = g_TLSky.mode == m_nSkyTab && !TL_StrICmp( picked.c_str(), p.name.c_str() );
+				if ( Hover( tx, ty, thumb, thumb ) )
+				{
+					hover = &p;
+					if ( s_bClick )
+					{
+						g_TLSky.mode = m_nSkyTab;
+						( spray ? g_TLSky.spray : g_TLSky.picture ) = p.name;
+						TL_SkyChanged();
+					}
+				}
+				if ( sel || hover == &p )
+					Ring( tx, ty, thumb, thumb, sel ? C_WHITE : C_WOOD );
+			}
+			const TLPic_t *about = hover ? hover : TLPics_Find( spray, picked );
+			if ( about )
+			{
+				char t[160];
+				const float a = about->aspect;
+				snprintf( t, sizeof( t ), "%s%s  \xC2\xB7  %dx%d%s%s%s", hover ? "" : "picked: ", about->name.c_str(), about->width, about->height,
+						  about->frames > 1 ? "  \xC2\xB7  animated" : "", !spray && a >= 1.9f && a <= 2.1f ? "  \xC2\xB7  2:1, wraps all the way round" : "",
+						  spray && !TL_StrICmp( about->name.c_str(), mine.c_str() ) ? "  \xC2\xB7  your spray" : "" );
+				line = t;
+			}
+		}
+		Text( F_SMALL, x, bottom + ( S( 22 ) - TextH( F_SMALL ) ) / 2, C_SUB, FitRight( F_SMALL, line, w ).c_str() );
+	}
+
+	// ---- ADD A FILE: the in-game file list (p2paint's) ----------------------------------------------------
+	void OpenFiles()
+	{
+		std::string dir = LastDir();
+		if ( dir.empty() || !TLP_IsDir( dir ) )
+			dir = TLP_IsDir( TLP_Home() + "/Pictures" ) ? TLP_Home() + "/Pictures" : TLP_Home();
+		GoTo( dir );
+	}
+
+	void GoTo( const std::string &dir )
+	{
+		std::vector<TLDirEntry_t> entries;
+		if ( !TLPics_ListDir( dir, entries ) )
+			return;		// can't open: stay where we are
+		m_Dir = dir;
+		m_Entries.swap( entries );
+		m_nFileScroll = 0;
+		if ( FILE *f = TLP_Open( LastDirFile().c_str(), "w" ) )
+		{
+			fprintf( f, "%s\n", m_Dir.c_str() );
+			fclose( f );
+		}
+	}
+
+	void FilesView( int x, int y, int w, int h )
+	{
+		Text( F_SMALL, x, y, C_SUB, FitLeft( F_SMALL, m_Dir.empty() ? "drives" : m_Dir, w ).c_str() );
+		// the folder above (from a drive's root, Windows: the drives "") and the usual places
+		const std::string home = TLP_Home(), root = TLP_Root( m_Dir );
+		const size_t cut = m_Dir.find_last_of( '/' );
+		const std::string up = m_Dir.size() <= root.size() ? ( root == "/" ? root : "" ) : cut == std::string::npos || cut < root.size() ? root : m_Dir.substr( 0, cut );
+		const struct { const char *label; std::string path; } places[] = { { "UP", up }, { "HOME", home }, { "PICTURES", home + "/Pictures" },
+			{ "DOWNLOADS", home + "/Downloads" }, { "DESKTOP", home + "/Desktop" } };
+		const int qy = y + S( 22 ), qh = S( 30 ), n = 5, qw = ( w - S( 8 ) * ( n - 1 ) ) / n;
+		for ( int i = 0; i < n; i++ )
+			if ( Button( x + i * ( qw + S( 8 ) ), qy, qw, qh, places[i].label, false, ( !i && up != m_Dir ) || TLP_IsDir( places[i].path ) ) )
+				GoTo( places[i].path );
+		// the list: folders, then the pictures; a click opens a folder or adds the file
+		const int ly = qy + qh + S( 12 ), lh = h - ( ly - y ), rowH = S( 30 ), visible = MAX( 1, lh / rowH ), rows = (int)m_Entries.size();
+		if ( Hover( x, ly, w, lh ) && s_nWheel )
+			m_nFileScroll -= s_nWheel * 3;
+		m_nFileScroll = clamp( m_nFileScroll, 0, MAX( 0, rows - visible ) );
+		if ( m_Entries.empty() )
+			Text( F_BODY, x, ly + S( 6 ), C_SUB, "no JPEG, PNG, GIF, WEBP, VTF or folders here" );
+		std::string open;
+		for ( int r = 0; r < visible && m_nFileScroll + r < rows; r++ )
+		{
+			const TLDirEntry_t &e = m_Entries[m_nFileScroll + r];
+			const int ry = ly + r * rowH, ip = MAX( 1, S( 3 ) ), ix = x + S( 10 ), iy = ry + ( rowH - S( 2 ) - 5 * ip ) / 2;
+			const bool hover = Hover( x, ry, w - S( 14 ), rowH - S( 2 ) );
+			Rect( x, ry, w - S( 14 ), rowH - S( 2 ), hover ? C_BTN_HOVER : C_BTN );
+			if ( e.dir )	// a little pixel folder / picture
+			{
+				Rect( ix, iy, 3 * ip, ip, C_WOOD );
+				Rect( ix, iy + ip, 6 * ip, 4 * ip, C_WOOD );
+			}
+			else
+			{
+				Rect( ix, iy, 6 * ip, 5 * ip, C_TEXT );
+				Rect( ix + ip, iy + ip, 4 * ip, 3 * ip, { 90, 160, 230, 255 } );
+				Rect( ix + ip, iy + 3 * ip, 4 * ip, ip, { 80, 170, 80, 255 } );
+			}
+			Text( F_BODY, x + S( 40 ), ry + ( rowH - S( 2 ) - TextH( F_BODY ) ) / 2, e.dir ? C_WOOD_LIGHT : C_TEXT,
+				  FitRight( F_BODY, e.dir ? e.name + "/" : e.name, w - S( 64 ) ).c_str() );
+			if ( hover && s_bClick )
+				open = e.name;
+		}
+		if ( rows > visible )
+		{
+			const int bh = MAX( S( 30 ), lh * visible / rows );
+			Rect( x + w - S( 6 ), ly, S( 6 ), lh, C_BTN );
+			Rect( x + w - S( 6 ), ly + ( lh - bh ) * m_nFileScroll / MAX( 1, rows - visible ), S( 6 ), bh, C_WOOD_DARK );
+		}
+		if ( !open.empty() )
+		{
+			const std::string path = m_Dir.empty() ? open + "/" : m_Dir.back() == '/' ? m_Dir + open : m_Dir + "/" + open;
+			if ( TLP_IsDir( path ) )
+				GoTo( path );
+			else if ( TLPics_Add( path ) )
+			{
+				m_nSkyTab = TL_SKY_PICTURE;
+				m_nView = VIEW_SKY;
+			}
+			s_bClick = false;
+		}
 	}
 };
 
@@ -1305,11 +1651,27 @@ static void CmdPickUp( const CCommand &args )
 static ConCommand s_cmdPickDown( "+triggerlook_pick", CmdPickDown, "triggerlook: SELECT TRIGGER picks the trigger under the crosshair (bound while picking)" );
 static ConCommand s_cmdPickUp( "-triggerlook_pick", CmdPickUp, "triggerlook: (the key went up)" );
 
-// every frame (TL_Tick): leaving / Esc / triggerlook off while picking; a left-over bind
+// every frame (TL_Tick): a picture ADD A FILE made (it becomes the sky); leaving / Esc / triggerlook off while
+// picking; a left-over bind
 void TLUI_Tick()
 {
 	if ( !s_pEngine || !TLUI_Ready() )
 		return;
+	static int s_nAddSerial;
+	const TLPicStatus_t st = TLPics_Status();
+	if ( st.serial != s_nAddSerial )
+	{
+		s_nAddSerial = st.serial;
+		if ( st.state == 2 )
+		{
+			TLPics_Refresh();
+			g_TLSky.mode = TL_SKY_PICTURE;
+			g_TLSky.picture = st.added;
+			TL_SkyChanged();
+		}
+		if ( st.state >= 2 )
+			Msg( "triggerlook: %s\n", st.text.c_str() );
+	}
 	if ( s_bPicking )
 	{
 		if ( s_nPicked >= 0 )
@@ -1439,6 +1801,8 @@ static void SetMenuOpen( bool open )
 		TL_PrebuildMeshes();
 	}
 	s_Menu.Show( open );
+	if ( open )
+		TL_ReadMap();	// before its first frame paints
 }
 
 void TLUI_SetOpen( bool open ) { SetMenuOpen( open ); }
@@ -1470,7 +1834,7 @@ bool TLUI_Init( IVEngineClient *pEngine )
 // Test helpers: the menu's state without clicking, and a timed console script (cfg "wait" doesn't work at
 // uncapped fps): lines "<seconds after the previous line> <command>", "#" comments
 //-----------------------------------------------------------------------------
-CON_COMMAND( triggerlook_ui, "triggerlook_ui select <types,ct1,...> | part fill|border | view main|custom | pickmode | delete | mark <text>: set the menu's state, or mark the info file (testing)" )
+CON_COMMAND( triggerlook_ui, "triggerlook_ui select <types,ct1,...> | part fill|border | view main|custom|sky|files | pickmode | delete | mark <text>: set the menu's state, or mark the info file (testing)" )
 {
 	if ( args.ArgC() == 2 && !TL_StrICmp( args[1], "pickmode" ) )
 	{
@@ -1484,7 +1848,7 @@ CON_COMMAND( triggerlook_ui, "triggerlook_ui select <types,ct1,...> | part fill|
 	}
 	if ( args.ArgC() < 3 )
 	{
-		Msg( "usage: triggerlook_ui select <type|ctN[,...]|all> | part fill|border | view main|custom | pickmode | delete\n" );
+		Msg( "usage: triggerlook_ui select <type|ctN[,...]|all> | part fill|border | view main|custom|sky|files | pickmode | delete\n" );
 		return;
 	}
 	if ( !TL_StrICmp( args[1], "select" ) )
@@ -1507,13 +1871,13 @@ CON_COMMAND( triggerlook_ui, "triggerlook_ui select <types,ct1,...> | part fill|
 	else if ( !TL_StrICmp( args[1], "part" ) )
 		s_Menu.SetPart( !TL_StrICmp( args[2], "border" ) ? PART_BORDER : PART_FILL );
 	else if ( !TL_StrICmp( args[1], "view" ) )
-		s_Menu.SetView( !TL_StrICmp( args[2], "custom" ) ? VIEW_CUSTOM : VIEW_MAIN );
+		s_Menu.SetView( !TL_StrICmp( args[2], "custom" ) ? VIEW_CUSTOM : !TL_StrICmp( args[2], "sky" ) ? VIEW_SKY : !TL_StrICmp( args[2], "files" ) ? VIEW_FILES : VIEW_MAIN );
 	else if ( !TL_StrICmp( args[1], "mark" ) )
 	{
 		// a line in the info file, for a test helper outside the game to wait for
 		char path[1024];
 		snprintf( path, sizeof( path ), "%s/info.txt", TLP_CacheDir() );
-		if ( FILE *f = fopen( path, "a" ) )
+		if ( FILE *f = TLP_Open( path, "a" ) )
 		{
 			fprintf( f, "mark %s\n", args[2] );
 			fclose( f );
@@ -1534,8 +1898,8 @@ void TL_RunScript()	// from TL_Tick
 	while ( s_nScriptPos < s_Script.size() && now >= s_flScriptNext )
 	{
 		const ScriptLine_t &l = s_Script[s_nScriptPos];
-		// "!ingame": wait until a map is up and its triggers read
-		if ( l.cmd == "!ingame" && !TL_Active() )
+		// "!ingame": wait until a map is up and (triggers ON) its triggers read
+		if ( l.cmd == "!ingame" && !( g_bTLShow ? TL_Active() : s_pEngine->IsInGame() ) )
 			return;
 		s_nScriptPos++;
 		Msg( "triggerlook_selftest: %s\n", l.cmd.c_str() );

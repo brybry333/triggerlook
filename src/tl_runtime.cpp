@@ -56,10 +56,12 @@
 #include "bspflags.h"
 #include "filesystem.h"
 #include "view_shared.h"
+#include "model_types.h"
 
 #include "tl_map.h"
 #include "tl_look.h"
 #include "tl_mesh.h"
+#include "tl_pics.h"
 #include "tl_ui.h"
 #include "tl_con.h"
 #include "tl_platform.h"
@@ -86,7 +88,7 @@ static IBaseFileSystem *s_pFileSystem;
 static IBaseClientDLL *s_pClient;		// GetPlayerView: which view is the player's
 static IEngineTrace *s_pTrace;			// SELECT TRIGGER (without it the world doesn't hide triggers from the pick)
 
-#define TRIGGERLOOK_VERSION "1.1"
+#define TRIGGERLOOK_VERSION "1.2"
 
 static bool s_bEnable = true;	// triggerlook_enable
 static bool s_bCull = true;		// triggerlook_cull
@@ -832,6 +834,8 @@ static TLRect_t ScreenRect( const Vector &mins, const Vector &maxs )
 }
 
 static const int MAX_ORDER_PAIRS = 20000;	// pairs checked per frame at most (the rest keeps far to near)
+static const int MAX_ORDER_STEPS = 60000;	// ... and candidates looked at (boxes round the camera cover the whole screen:
+											// hundreds of them, nodraw sides seen from outside the map, were n x n)
 static std::vector<TLRect_t> s_Rects;
 static std::vector<int> s_ByX, s_InDeg, s_Rank, s_First, s_Next, s_Heap, s_ByDist;
 static std::vector<std::pair<int, int>> s_Edges;	// (i, j): i is drawn before j
@@ -859,12 +863,12 @@ static void OrderTriggers( const Vector &camera )
 	std::sort( s_ByX.begin(), s_ByX.end(), []( int a, int b ) { return s_Rects[a].x0 < s_Rects[b].x0; } );
 	s_Edges.clear();
 	s_InDeg.assign( n, 0 );
-	int pairs = 0;
-	for ( int a = 0; a < n && pairs < MAX_ORDER_PAIRS; a++ )
+	int pairs = 0, steps = 0;
+	for ( int a = 0; a < n && pairs < MAX_ORDER_PAIRS && steps < MAX_ORDER_STEPS; a++ )
 	{
 		const int i = s_ByX[a];
 		const TLRect_t &ri = s_Rects[i];
-		for ( int b = a + 1; b < n && s_Rects[s_ByX[b]].x0 <= ri.x1 && pairs < MAX_ORDER_PAIRS; b++ )
+		for ( int b = a + 1; b < n && s_Rects[s_ByX[b]].x0 <= ri.x1 && pairs < MAX_ORDER_PAIRS && ++steps < MAX_ORDER_STEPS; b++ )
 		{
 			const int j = s_ByX[b];
 			const TLRect_t &rj = s_Rects[j];
@@ -940,7 +944,8 @@ static int s_nCamArea = 0, s_nPVSArea = -1, s_nAreaCulled;		// (... + area: clos
 static std::vector<unsigned char> s_PVS;	// the camera cluster's PVS row
 static std::vector<unsigned char> s_AreaBits;	// the areas drawn from the camera's area (empty = all)
 static std::vector<char> s_ModelSeen;		// by model: the camera cluster can see it (worked out once per cluster)
-static std::vector<int> s_SeenModels;		// ... the list of those
+static std::vector<int> s_SeenModels;		// ... the list of those (of the types shown, and custom triggers)
+static int s_nSeenShow = -1, s_nSeenCTs = -1;	// the shown types / custom trigger list it was made for
 static VMatrix s_BuiltVP;
 
 CON_COMMAND( triggerlook_pvs, "triggerlook_pvs [0/1]: leave out triggers the map's visibility (and its closed area portals) say can't be seen from here (0 = testing)" )
@@ -1019,10 +1024,17 @@ static void BuildChunks( IMatRenderContext *ctx, const Vector &camera, const Vec
 	// ... and from its area: triggers in areas that only join it through closed area portals aren't drawn (the game
 	// draws nothing there - black - and servers send nothing from there, so !st doesn't show them either)
 	s_nCamArea = s_bPVS ? s_Map.PointArea( camera ) : 0;
-	if ( s_nCamCluster != s_nPVSCluster || s_nCamArea != s_nPVSArea || (int)s_ModelSeen.size() != s_Map.NumModels() )
+	// (hidden types aren't in the list at all: thousands of nodraw models cost nothing while hidden)
+	int show = 0;
+	for ( int t = 0; t < TL_TYPES; t++ )
+		show |= g_TLLook[t].show << t;
+	if ( s_nCamCluster != s_nPVSCluster || s_nCamArea != s_nPVSArea || (int)s_ModelSeen.size() != s_Map.NumModels() || show != s_nSeenShow ||
+		 g_nTLCTListVersion != s_nSeenCTs )
 	{
 		s_nPVSCluster = s_nCamCluster;
 		s_nPVSArea = s_nCamArea;
+		s_nSeenShow = show;
+		s_nSeenCTs = g_nTLCTListVersion;
 		if ( s_nCamCluster < 0 || !s_Map.ClusterPVS( s_nCamCluster, s_PVS ) )
 			s_PVS.clear();
 		if ( !s_Map.AreaFlood( s_nCamArea, s_AreaBits ) )
@@ -1049,7 +1061,7 @@ static void BuildChunks( IMatRenderContext *ctx, const Vector &camera, const Vec
 				s_nAreaCulled += !joined;
 			}
 			s_ModelSeen[mi] = seen;
-			if ( seen )
+			if ( seen && ( ( show >> s_Map.Model( mi )->type & 1 ) || s_CTOf[mi] >= 0 ) )
 				s_SeenModels.push_back( mi );
 		}
 		s_nPVSCulled = 0;
@@ -1190,40 +1202,325 @@ static void HideStockTriggers( bool hide )
 }
 
 //-----------------------------------------------------------------------------
-// What drawing costs: per 2 s window, the time DrawTriggers took per frame (average, worst) and the frames
+// The custom skybox (g_TLSky): where the map's sky faces show (the engine draws nothing there: its 2D sky and the
+// 3D skybox show through) a colour, a spray or a picture round the camera. Drawn by an opaque renderable, after the
+// world and before anything see-through (glass, water, sprites, beams in front of the sky stay on top):
+//   1. the sky faces of the areas the camera's joins, depth-tested, invisible (the trigger material, alpha 0: no depth
+//      written either, or the sun's visibility test behind them fails): stencil 1 where they show; then the water
+//      faces the same way, stencil 0 (cheap water is drawn before us without depth: the sky would cover it)
+//   2. a box (a 2:1 picture: a sphere, the picture wrapped round) round the camera where the stencil is 1, no depth
+//   3. the stencil back to 0
+// Nothing of it runs while the sky is OFF (not in the leaf system).
 //-----------------------------------------------------------------------------
-static struct { double sum, max, since; int draws, frames, reused; } s_Cost;
-static struct { double avg, max, secs; int draws, frames, reused; } s_LastCost;
+static IMaterial *s_pSkyMaterial;		// the current one (materials/triggerlook/skycolour.vmt, or a sky/ one)
+static int s_nSkyVersion = -1;			// g_nTLSkyVersion it was picked for
+static float s_flSkyAspect = 1;			// its picture's own width / height
+static std::vector<std::pair<int, IMesh *> > s_SkyMeshes;	// (area, sky faces seen from it), area 0 = always drawn,
+														// area -1 = the map's water faces
+static bool s_bSkyMeshesDirty;			// the map changed: built on the next draw (in the material's vertex format, known
+										// once it's bound: asked at map load it crashed the game)
+static int s_nSkyTris, s_nSkyDrawn, s_nSkyCamArea = -1;		// (triggerlook_info) last frame: meshes drawn
+static std::vector<unsigned char> s_SkyAreas;	// the areas drawn from the camera's (empty = all)
 
-static void CostTick( double now )
+static void DestroySkyMeshes()
 {
-	s_Cost.frames++;
-	if ( s_Cost.since <= 0 )
-		s_Cost.since = now;
-	if ( now - s_Cost.since < 2.0 )
+	if ( s_SkyMeshes.empty() || !s_pMatSys )
 		return;
-	s_LastCost.avg = s_Cost.draws ? s_Cost.sum / s_Cost.draws : 0;
-	s_LastCost.max = s_Cost.max;
-	s_LastCost.secs = now - s_Cost.since;
-	s_LastCost.draws = s_Cost.draws;
-	s_LastCost.frames = s_Cost.frames;
-	s_LastCost.reused = s_Cost.reused;
-	s_Cost.sum = s_Cost.max = 0;
-	s_Cost.draws = s_Cost.frames = s_Cost.reused = 0;
-	s_Cost.since = now;
+	CMatRenderContextPtr ctx( s_pMatSys );
+	for ( auto &m : s_SkyMeshes )
+		ctx->DestroyStaticMesh( m.second );
+	s_SkyMeshes.clear();
+	s_nSkyTris = 0;
+}
+
+// the map's sky faces as static meshes (once per map, on the first draw), one set per area; then its water faces
+// (area -1)
+static void BuildSkyMeshes()
+{
+	DestroySkyMeshes();
+	s_bSkyMeshesDirty = false;
+	s_nSkyCamArea = -1;
+	if ( !s_pDrawMaterial )
+		return;
+	CMatRenderContextPtr ctx( s_pMatSys );
+	auto build = [&]( const std::vector<Vector> &verts, const std::vector<int> &first, const std::vector<int> *areas )
+	{
+		const int nPolys = first.empty() ? 0 : (int)first.size() - 1;
+		auto areaOf = [&]( int k ) { return areas ? ( *areas )[k] : -1; };
+		std::vector<int> order( nPolys );
+		for ( int i = 0; i < nPolys; i++ )
+			order[i] = i;
+		std::stable_sort( order.begin(), order.end(), [&]( int a, int b ) { return areaOf( a ) < areaOf( b ); } );
+		for ( int k0 = 0; k0 < nPolys; )
+		{
+			// as many polygons of one area as fit one mesh (16-bit indices)
+			const int area = areaOf( order[k0] );
+			int nv = 0, ni = 0, k1 = k0;
+			for ( ; k1 < nPolys && areaOf( order[k1] ) == area; k1++ )
+			{
+				const int c = first[order[k1] + 1] - first[order[k1]];
+				if ( nv + c > 30000 )
+					break;
+				nv += c;
+				ni += 3 * ( c - 2 );
+			}
+			IMesh *pMesh = k1 > k0 ? ctx->CreateStaticMesh( s_pDrawMaterial->GetVertexFormat() & ~VERTEX_FORMAT_COMPRESSED,
+															TEXTURE_GROUP_STATIC_VERTEX_BUFFER_OTHER, s_pDrawMaterial ) : NULL;
+			if ( !pMesh )
+				break;
+			CMeshBuilder mb;
+			mb.Begin( pMesh, MATERIAL_TRIANGLES, nv, ni );
+			for ( int k = k0; k < k1; k++ )
+				for ( int v = first[order[k]]; v < first[order[k] + 1]; v++ )
+				{
+					mb.Position3fv( verts[v].Base() );
+					mb.Color4ub( 0, 0, 0, 0 );
+					mb.TexCoord2f( 0, 0, 0 );
+					mb.AdvanceVertex();
+				}
+			for ( int k = k0, base = 0; k < k1; k++ )
+			{
+				const int c = first[order[k] + 1] - first[order[k]];
+				for ( int i = 1; i + 1 < c; i++ )
+				{
+					mb.FastIndex( base );
+					mb.FastIndex( base + i );
+					mb.FastIndex( base + i + 1 );
+				}
+				base += c;
+				s_nSkyTris += c - 2;
+			}
+			mb.End();
+			s_SkyMeshes.push_back( { area, pMesh } );
+			k0 = k1;
+		}
+	};
+	build( s_Map.m_SkyVerts, s_Map.m_SkyFirst, &s_Map.m_SkyArea );
+	build( s_Map.m_WaterVerts, s_Map.m_WaterFirst, NULL );
+}
+
+// the material for g_TLSky (when it changed); none = the sky isn't drawn
+static void PickSkyMaterial()
+{
+	if ( s_nSkyVersion == g_nTLSkyVersion || !s_pMatSys )
+		return;
+	s_nSkyVersion = g_nTLSkyVersion;
+	if ( s_pSkyMaterial )
+		s_pSkyMaterial->DecrementReferenceCount();
+	s_pSkyMaterial = NULL;
+	s_flSkyAspect = 1;
+	std::string name = "triggerlook/skycolour";
+	if ( g_TLSky.mode == TL_SKY_SPRAY || g_TLSky.mode == TL_SKY_PICTURE )
+	{
+		const TLPic_t *p = TLPics_Find( g_TLSky.mode == TL_SKY_SPRAY, g_TLSky.mode == TL_SKY_SPRAY ? g_TLSky.spray : g_TLSky.picture );
+		name = p ? p->material : "";
+		s_flSkyAspect = p ? p->aspect : 1;
+	}
+	if ( g_TLSky.mode == TL_SKY_OFF || name.empty() )
+		return;
+	IMaterial *pMat = s_pMatSys->FindMaterial( name.c_str(), TEXTURE_GROUP_OTHER, false );
+	if ( pMat && !pMat->IsErrorMaterial() )
+	{
+		pMat->IncrementReferenceCount();
+		s_pSkyMaterial = pMat;
+	}
+	else
+		Warning( "triggerlook: no sky material %s\n", name.c_str() );
+}
+
+// the box (a sphere for a 2:1 panorama) round (0, 0, 0), moved to the camera when drawn: radius 100, texture
+// coordinates cropped to the picture's own aspect (the texture is stretched to powers of two), a box side shows the
+// whole picture. Built when the sky changes.
+static IMesh *s_pSkyShape;
+static int s_nSkyShapeVersion = -1;
+static void BuildSkyShape( IMatRenderContext *ctx )
+{
+	if ( s_pSkyShape )
+		ctx->DestroyStaticMesh( s_pSkyShape );
+	s_nSkyShapeVersion = s_nSkyVersion;
+	// (the material's own vertex format: a static mesh in another one isn't drawn)
+	s_pSkyShape = ctx->CreateStaticMesh( s_pSkyMaterial->GetVertexFormat() & ~VERTEX_FORMAT_COMPRESSED, TEXTURE_GROUP_STATIC_VERTEX_BUFFER_OTHER, s_pSkyMaterial );
+	if ( !s_pSkyShape )
+		return;
+	const float R = 100;
+	const Vector camera( 0, 0, 0 );
+	const unsigned char *c = g_TLSky.mode == TL_SKY_COLOUR ? g_TLSky.rgb : (const unsigned char *)"\xff\xff\xff";
+	IMesh *pMesh = s_pSkyShape;
+	CMeshBuilder mb;
+	const float a = s_flSkyAspect;
+	if ( g_TLSky.mode == TL_SKY_PICTURE && a >= 1.9f && a <= 2.1f )
+	{
+		// latitude / longitude: u = 0.5 straight ahead at yaw 0, growing to the right, 0..1 with the seam behind (yaw 180):
+		// also right for a VTF that clamps its edges
+		const int NS = 64, NR = 32;
+		mb.Begin( pMesh, MATERIAL_TRIANGLES, ( NS + 1 ) * ( NR + 1 ), NS * NR * 6 );
+		for ( int j = 0; j <= NR; j++ )
+			for ( int i = 0; i <= NS; i++ )
+			{
+				const float th = M_PI_F + 2 * M_PI_F * i / NS, ph = M_PI_F * j / NR;
+				const Vector d( sinf( ph ) * cosf( th ), sinf( ph ) * sinf( th ), cosf( ph ) );
+				mb.Position3fv( ( camera + d * R ).Base() );
+				mb.Normal3fv( ( -d ).Base() );
+				mb.Color4ub( c[0], c[1], c[2], 255 );
+				mb.TexCoord2f( 0, 1.0f - (float)i / NS, (float)j / NR );
+				mb.AdvanceVertex();
+			}
+		for ( int j = 0; j < NR; j++ )
+			for ( int i = 0; i < NS; i++ )
+			{
+				const int v = j * ( NS + 1 ) + i;
+				const int t[6] = { v, v + 1, v + NS + 2, v, v + NS + 2, v + NS + 1 };
+				for ( int k = 0; k < 6; k++ )
+					mb.FastIndex( t[k] );
+			}
+	}
+	else
+	{
+		// six sides, each seen from inside: (towards, right, up)
+		static const float s_Side[6][3][3] = {
+			{ { 1, 0, 0 }, { 0, -1, 0 }, { 0, 0, 1 } }, { { 0, 1, 0 }, { 1, 0, 0 }, { 0, 0, 1 } }, { { -1, 0, 0 }, { 0, 1, 0 }, { 0, 0, 1 } },
+			{ { 0, -1, 0 }, { -1, 0, 0 }, { 0, 0, 1 } }, { { 0, 0, 1 }, { 0, -1, 0 }, { -1, 0, 0 } }, { { 0, 0, -1 }, { 0, -1, 0 }, { 1, 0, 0 } } };
+		const float u0 = a > 1 ? 0.5f - 0.5f / a : 0, u1 = 1 - u0, v0 = a < 1 ? 0.5f - 0.5f * a : 0, v1 = 1 - v0;
+		mb.Begin( pMesh, MATERIAL_TRIANGLES, 24, 36 );
+		for ( int f = 0; f < 6; f++ )
+		{
+			const Vector d( s_Side[f][0][0], s_Side[f][0][1], s_Side[f][0][2] ), r( s_Side[f][1][0], s_Side[f][1][1], s_Side[f][1][2] ),
+				u( s_Side[f][2][0], s_Side[f][2][1], s_Side[f][2][2] );
+			const float corner[4][4] = { { -1, 1, u0, v0 }, { 1, 1, u1, v0 }, { 1, -1, u1, v1 }, { -1, -1, u0, v1 } };
+			for ( int k = 0; k < 4; k++ )
+			{
+				mb.Position3fv( ( camera + ( d + r * corner[k][0] + u * corner[k][1] ) * R ).Base() );
+				mb.Normal3fv( ( -d ).Base() );
+				mb.Color4ub( c[0], c[1], c[2], 255 );
+				mb.TexCoord2f( 0, corner[k][2], corner[k][3] );
+				mb.AdvanceVertex();
+			}
+			const int t[6] = { 0, 1, 2, 0, 2, 3 };
+			for ( int k = 0; k < 6; k++ )
+				mb.FastIndex( f * 4 + t[k] );
+		}
+	}
+	mb.End();
+}
+
+static void DrawSky( IMatRenderContext *ctx, const Vector &camera )
+{
+	if ( !s_pSkyMaterial || !s_pDrawMaterial )
+		return;
+	// the areas the game draws from here (sky faces in the others show nothing of the sky: the game draws them black)
+	const int area = s_Map.PointArea( camera );
+	if ( area != s_nSkyCamArea )
+	{
+		s_nSkyCamArea = area;
+		if ( !s_Map.AreaFlood( area, s_SkyAreas ) )
+			s_SkyAreas.clear();
+	}
+	ctx->MatrixMode( MATERIAL_MODEL );
+	ctx->PushMatrix();
+	ctx->LoadIdentity();
+	ctx->ClearBuffers( false, false, true );
+	ctx->SetStencilEnable( true );
+	ctx->SetStencilWriteMask( 0xFF );
+	ctx->SetStencilTestMask( 0xFF );
+	ctx->SetStencilReferenceValue( 1 );
+	ctx->SetStencilCompareFunction( STENCILCOMPARISONFUNCTION_ALWAYS );
+	ctx->SetStencilPassOperation( STENCILOPERATION_REPLACE );
+	ctx->SetStencilFailOperation( STENCILOPERATION_KEEP );
+	ctx->SetStencilZFailOperation( STENCILOPERATION_KEEP );
+	ctx->Bind( s_pDrawMaterial );
+	if ( s_bSkyMeshesDirty )
+		BuildSkyMeshes();
+	s_nSkyDrawn = 0;
+	for ( const auto &m : s_SkyMeshes )
+		if ( !m.first || ( m.first > 0 && ( s_SkyAreas.empty() || ( m.first >> 3 < (int)s_SkyAreas.size() && ( s_SkyAreas[m.first >> 3] & ( 1 << ( m.first & 7 ) ) ) ) ) ) )
+		{
+			m.second->Draw();
+			s_nSkyDrawn++;
+		}
+	ctx->SetStencilReferenceValue( 0 );
+	for ( const auto &m : s_SkyMeshes )
+		if ( m.first < 0 )
+			m.second->Draw();
+	ctx->SetStencilReferenceValue( 1 );
+	ctx->SetStencilCompareFunction( STENCILCOMPARISONFUNCTION_EQUAL );
+	ctx->SetStencilPassOperation( STENCILOPERATION_KEEP );
+	ctx->Bind( s_pSkyMaterial );
+	if ( s_nSkyShapeVersion != s_nSkyVersion )
+		BuildSkyShape( ctx );
+	ctx->LoadIdentity();
+	ctx->Translate( camera.x, camera.y, camera.z );
+	if ( s_pSkyShape )
+		s_pSkyShape->Draw();
+	// the stencil as everything else expects it: off, defaults, 0 everywhere
+	ctx->SetStencilEnable( false );
+	ctx->SetStencilCompareFunction( STENCILCOMPARISONFUNCTION_ALWAYS );
+	ctx->SetStencilPassOperation( STENCILOPERATION_KEEP );
+	ctx->SetStencilReferenceValue( 0 );
+	ctx->SetStencilTestMask( 0xFFFFFFFF );
+	ctx->SetStencilWriteMask( 0xFFFFFFFF );
+	ctx->ClearBuffers( false, false, true );
+	ctx->MatrixMode( MATERIAL_MODEL );
+	ctx->PopMatrix();
 }
 
 //-----------------------------------------------------------------------------
-// The layer: a translucent renderable in the leaf system, so we draw in the world
+// What drawing costs: per 2 s window, the time DrawTriggers took per frame (average, worst) and the frames
 //-----------------------------------------------------------------------------
-class CTLLayer : public CDefaultClientRenderable
+struct Cost_t { double sum, max, since; int draws, frames, reused; };
+struct LastCost_t { double avg, max, secs; int draws, frames, reused; };
+static Cost_t s_Cost, s_SkyCost;			// the triggers, the sky
+static LastCost_t s_LastCost, s_SkyLastCost;
+
+static void CostTick( double now, Cost_t &c, LastCost_t &last )
+{
+	c.frames++;
+	if ( c.since <= 0 )
+		c.since = now;
+	if ( now - c.since < 2.0 )
+		return;
+	last = { c.draws ? c.sum / c.draws : 0, c.max, now - c.since, c.draws, c.frames, c.reused };
+	c = { 0, 0, now, 0, 0, 0 };
+}
+
+static void AddCost( Cost_t &c, double dt )
+{
+	c.sum += dt;
+	c.max = MAX( c.max, dt );
+	c.draws++;
+}
+
+//-----------------------------------------------------------------------------
+// The view being drawn: the player's own, or another (the 3D skybox's camera sits in the sky room, water reflections
+// and monitors are elsewhere: nothing of ours there). The water refraction view has the player's camera too.
+//-----------------------------------------------------------------------------
+static bool PlayerView( IMatRenderContext *ctx, Vector &camera, QAngle &angles )
+{
+	VMatrix view;
+	ctx->GetMatrix( MATERIAL_VIEW, &view );
+	camera = TL_ViewOrigin( view );
+	CViewSetup player;
+	const bool havePlayer = s_pClient && s_pClient->GetPlayerView( player );
+	if ( havePlayer && player.origin.DistToSqr( camera ) > 1.0f )
+		return false;
+	if ( havePlayer )
+		angles = player.angles;
+	else
+		s_pEngine->GetViewAngles( angles );
+	return true;
+}
+
+//-----------------------------------------------------------------------------
+// The layers: renderables in the leaf system, so we draw in the world (the triggers see-through, after everything
+// else in their leaf; the sky opaque, after the world)
+//-----------------------------------------------------------------------------
+class CTLRenderable : public CDefaultClientRenderable
 {
 public:
-	CTLLayer()
+	explicit CTLRenderable( bool translucent ) : m_bTranslucent( translucent )
 	{
-		m_szLevel[0] = 0;
 		memset( &m_Identity, 0, sizeof( m_Identity ) );
 		m_Identity[0][0] = m_Identity[1][1] = m_Identity[2][2] = 1;
+		m_vecCamera.Init();
 	}
 
 	// IHandleEntity / IClientUnknown: not an entity
@@ -1243,7 +1540,7 @@ public:
 	virtual const QAngle &GetRenderAngles() { static const QAngle s_Zero( 0, 0, 0 ); return s_Zero; }
 	virtual const matrix3x4_t &RenderableToWorldTransform() { return m_Identity; }
 	virtual bool ShouldDraw() { return true; }
-	virtual bool IsTransparent() { return true; }
+	virtual bool IsTransparent() { return m_bTranslucent; }
 	virtual void GetRenderBounds( Vector &mins, Vector &maxs )
 	{
 		mins.Init( -1, -1, -1 );
@@ -1256,36 +1553,75 @@ public:
 		maxs.Init( MAX_COORD_FLOAT, MAX_COORD_FLOAT, MAX_COORD_FLOAT );
 	}
 
+	// in the leaf system or not (want); a new session's handle is stale (the client purged it)
+	void Register( bool want, bool newSession )
+	{
+		if ( newSession )
+			RenderHandle() = INVALID_CLIENT_RENDER_HANDLE;
+		if ( want && RenderHandle() == INVALID_CLIENT_RENDER_HANDLE )
+			s_pLeafSystem->AddRenderable( this, m_bTranslucent ? RENDER_GROUP_TRANSLUCENT_ENTITY : RENDER_GROUP_OPAQUE_ENTITY );
+		else if ( !want && RenderHandle() != INVALID_CLIENT_RENDER_HANDLE )
+		{
+			s_pLeafSystem->RemoveRenderable( RenderHandle() );
+			RenderHandle() = INVALID_CLIENT_RENDER_HANDLE;
+		}
+	}
+
+protected:
+	matrix3x4_t m_Identity;
+	Vector m_vecCamera;
+	bool m_bTranslucent;
+};
+
+static void DrawSky( IMatRenderContext *ctx, const Vector &camera );
+
+class CTLSkyLayer : public CTLRenderable
+{
+public:
+	CTLSkyLayer() : CTLRenderable( false ) {}
 	virtual int DrawModel( int flags )
 	{
 		CMatRenderContextPtr pRenderContext( s_pMatSys );
-		VMatrix view;
-		pRenderContext->GetMatrix( MATERIAL_VIEW, &view );
-		const Vector camera = TL_ViewOrigin( view );
-		// only in the player's own view: not the 3D skybox's (its camera sits in the sky room, the triggers would show
-		// through the sky), water reflections or monitors - those cameras are elsewhere (and mustn't become our sort
-		// position: the next view sorts by it)
-		CViewSetup player;
-		const bool havePlayer = s_pClient && s_pClient->GetPlayerView( player );
-		if ( havePlayer && player.origin.DistToSqr( camera ) > 1.0f )
+		Vector camera;
+		QAngle angles;
+		// the player's own view on the screen (the water refraction view has the same camera but its own render target)
+		if ( ( flags & ( STUDIO_SHADOWDEPTHTEXTURE | STUDIO_SSAODEPTHTEXTURE ) ) || !PlayerView( pRenderContext, camera, angles ) ||
+			 pRenderContext->GetRenderTarget() )
+			return 1;
+		const double t0 = Plat_FloatTime();
+		DrawSky( pRenderContext, camera );
+		AddCost( s_SkyCost, Plat_FloatTime() - t0 );
+		return 1;
+	}
+};
+static CTLSkyLayer s_Sky;
+
+class CTLLayer : public CTLRenderable
+{
+public:
+	CTLLayer() : CTLRenderable( true ) { m_szLevel[0] = 0; }
+
+	virtual int DrawModel( int flags )
+	{
+		CMatRenderContextPtr pRenderContext( s_pMatSys );
+		// only in the player's own view (and the water refraction view: same camera); other cameras mustn't become our
+		// sort position either (the next view sorts by it)
+		Vector camera;
+		QAngle ang;
+		if ( !PlayerView( pRenderContext, camera, ang ) )
 			return 1;
 		m_vecCamera = camera;
 		// where the crosshair points (SELECT TRIGGER)
-		QAngle ang = player.angles;
-		if ( !havePlayer )
-			s_pEngine->GetViewAngles( ang );
 		const float pitch = ang.x * ( M_PI_F / 180.0f ), yaw = ang.y * ( M_PI_F / 180.0f );
 		Vector fwd( cosf( pitch ) * cosf( yaw ), cosf( pitch ) * sinf( yaw ), -sinf( pitch ) );
 		const double t0 = Plat_FloatTime();
 		DrawTriggers( pRenderContext, m_vecCamera, fwd );
-		const double dt = Plat_FloatTime() - t0;
-		s_Cost.sum += dt;
-		s_Cost.max = MAX( s_Cost.max, dt );
-		s_Cost.draws++;
+		AddCost( s_Cost, Plat_FloatTime() - t0 );
 		return 1;
 	}
 
-	// (Re)register with the leaf system on a new session (the client purged our handle) and read the new map
+	// (Re)register with the leaf system on a new session (the client purged our handles) and read the new map (when
+	// anything of ours needs it: triggers ON, the sky, the menu)
 	bool EnsureReady()
 	{
 		if ( !ConnectInterfaces() )
@@ -1297,16 +1633,31 @@ public:
 		}
 		const char *level = s_pEngine->GetLevelName();
 		const bool sameSession = !m_bLeftGame && !strcmp( level, m_szLevel );
+		if ( !sameSession )
+			m_bRead = false;
 		// in the leaf system only while drawing: every view walks a registered renderable in every visible leaf
-		const bool want = s_bEnable && g_bTLShow && s_pDrawMaterial;
-		if ( sameSession && !want && RenderHandle() != INVALID_CLIENT_RENDER_HANDLE )
-		{
-			s_pLeafSystem->RemoveRenderable( RenderHandle() );
-			RenderHandle() = INVALID_CLIENT_RENDER_HANDLE;
-		}
+		const bool want = s_bEnable && g_bTLShow && s_pDrawMaterial, sky = s_bEnable && g_TLSky.mode != TL_SKY_OFF;
+		Register( want && m_bRead, !sameSession );
+		const bool skyOK = s_pSkyMaterial && s_pDrawMaterial && !s_Map.m_SkyArea.empty() && s_pMatSys->StencilBufferBits() > 0;
+		s_Sky.Register( sky && m_bRead && skyOK, !sameSession );
+		TL_StrCopy( m_szLevel, level, sizeof( m_szLevel ) );
+		m_bLeftGame = false;
 		if ( !s_bEnable )
 			return false;		// (off entirely: the map isn't even read)
-		if ( sameSession && ( !want || RenderHandle() != INVALID_CLIENT_RENDER_HANDLE ) )
+		if ( !g_bTLShow && !sky && !TLUI_IsOpen() )
+		{
+			// nothing of ours shows: the map is read once something needs it (the menu: its custom triggers come from it)
+			if ( s_Map.Level()[0] && strcmp( level, s_Map.Level() ) )
+			{
+				s_Map.Clear();		// (the menu would show the last map's custom triggers)
+				DestroyOccluders();
+				DestroySkyMeshes();
+				s_Meshes.clear();
+				s_Place.clear();
+			}
+			return true;
+		}
+		if ( m_bRead )
 			return true;
 		if ( !s_pDrawMaterial )
 		{
@@ -1318,19 +1669,21 @@ public:
 				s_pDrawMaterial = pMat;
 			}
 			else
-				Warning( "triggerlook: materials/triggerlook/trigger.vmt is missing (run install.sh)\n" );
+				Warning( "triggerlook: materials/triggerlook/trigger.vmt couldn't be written into the game folder (see the \"can't write\" line at startup)\n" );
+		}
+		if ( !s_pDepthMaterial )
+		{
+			IMaterial *pMat = s_pMatSys->FindMaterial( "triggerlook/depth", TEXTURE_GROUP_OTHER, false );
+			if ( pMat && !pMat->IsErrorMaterial() )
+			{
+				pMat->IncrementReferenceCount();
+				s_pDepthMaterial = pMat;
+			}
 		}
 		if ( strcmp( level, s_Map.Level() ) )
 		{
-			if ( !s_pDepthMaterial )
-			{
-				IMaterial *pMat = s_pMatSys->FindMaterial( "triggerlook/depth", TEXTURE_GROUP_OTHER, false );
-				if ( pMat && !pMat->IsErrorMaterial() )
-				{
-					pMat->IncrementReferenceCount();
-					s_pDepthMaterial = pMat;
-				}
-			}
+			const double t0 = Plat_FloatTime();
+			double t1 = t0, t2 = t0;
 			s_SolidLookingCache.clear();
 			s_TextureSolidCache.clear();
 			s_nCheckBytes = 0;
@@ -1338,19 +1691,22 @@ public:
 			if ( !s_Map.Load( s_pEngine->GetGameDirectory(), level, OpenGameMap, s_pDepthMaterial ? SolidLookingSeeThrough : NULL ) )
 				s_Map.Clear();
 			BuildOccluders();
+			DestroySkyMeshes();
+			s_bSkyMeshesDirty = true;
 			s_Meshes.assign( s_Map.NumModels(), TLMesh_t() );
+			t1 = Plat_FloatTime();
 			PlaceModels();
+			t2 = Plat_FloatTime();
 			PrebuildMeshes();
+			Msg( "triggerlook: map ready in %.0f ms (%d models: read %.0f, placed %.0f, meshes %.0f)\n", ( Plat_FloatTime() - t0 ) * 1000, s_Map.NumModels(),
+				 ( t1 - t0 ) * 1000, ( t2 - t1 ) * 1000, ( Plat_FloatTime() - t2 ) * 1000 );
 			s_nPVSCluster = -2;		// (the visible list belongs to the old map)
 			s_nPVSArea = -1;
 			s_nHLModel = -1;		// (so does the highlight mesh)
 		}
-		if ( !sameSession )
-			RenderHandle() = INVALID_CLIENT_RENDER_HANDLE;	// stale after a level change
-		if ( s_bEnable && g_bTLShow && s_pDrawMaterial && RenderHandle() == INVALID_CLIENT_RENDER_HANDLE )
-			s_pLeafSystem->AddRenderable( this, RENDER_GROUP_TRANSLUCENT_ENTITY );
-		TL_StrCopy( m_szLevel, level, sizeof( m_szLevel ) );
-		m_bLeftGame = false;
+		m_bRead = true;
+		Register( want, false );
+		s_Sky.Register( sky && skyOK, false );
 		return true;
 	}
 
@@ -1358,13 +1714,14 @@ public:
 	bool InGame() const { return !m_bLeftGame; }
 
 private:
-	matrix3x4_t m_Identity;
-	Vector m_vecCamera;
 	char m_szLevel[MAX_PATH];
 	bool m_bLeftGame = true;
+	bool m_bRead = false;		// this session's map read (or tried)
 };
 
 static CTLLayer s_Layer;
+
+void TL_ReadMap() { s_Layer.EnsureReady(); }
 
 bool TL_Active()
 {
@@ -1383,6 +1740,7 @@ void TL_Tick()
 {
 	if ( !ConnectInterfaces() )
 		return;
+	PickSkyMaterial();
 	if ( !s_pEngine->IsInGame() )
 		s_Layer.LeftGame();
 	else
@@ -1393,7 +1751,8 @@ void TL_Tick()
 	s_nReusedLast = s_nReused;
 	s_Cost.reused += s_nReused;
 	s_nReused = 0;
-	CostTick( Plat_FloatTime() );
+	CostTick( Plat_FloatTime(), s_Cost, s_LastCost );
+	CostTick( Plat_FloatTime(), s_SkyCost, s_SkyLastCost );
 	TL_LookTick( Plat_FloatTime() );
 	TLUI_Tick();
 	TL_RunScript();
@@ -1476,7 +1835,11 @@ static void MainThreadInit()
 		return;
 	}
 	if ( ConnectInterfaces() || s_pEngine )
+	{
 		InstallGameFiles( s_pEngine->GetGameDirectory() );
+		TLPics_Init( s_pEngine->GetGameDirectory() );
+		TLPics_Refresh();
+	}
 	if ( !TL_RegisterCommands( pCvar ) )
 	{
 		Warning( "triggerlook: no VEngineCvar004, not started\n" );
@@ -1501,12 +1864,12 @@ CON_COMMAND( triggerlook_menu, "triggerlook: open / close the trigger menu (bind
 }
 
 // triggerlook_set <type|all> [show 0/1] [fill r g b a] [border r g b a] [width n]  (scripts, tests)
-CON_COMMAND( triggerlook_set, "triggerlook_set <teleport|booster|push|gravity|other|all> [show 0/1] [fill r g b a] [border r g b a] [width n]" )
+CON_COMMAND( triggerlook_set, "triggerlook_set <teleport|booster|push|gravity|other|clip|invisible|nodraw|all> [show 0/1] [fill r g b a] [border r g b a] [width n]" )
 {
 	int mask = args.ArgC() > 1 ? TL_TypeMask( args[1] ) : 0;
 	if ( !mask )
 	{
-		Msg( "usage: triggerlook_set <teleport|booster|push|gravity|other|all> [show 0/1] [fill r g b a] [border r g b a] [width 0-%d]\n", TL_MAX_WIDTH );
+		Msg( "usage: triggerlook_set <teleport|booster|push|gravity|other|clip|invisible|nodraw|all> [show 0/1] [fill r g b a] [border r g b a] [width 0-%d]\n", TL_MAX_WIDTH );
 		return;
 	}
 	auto byte = []( const char *s ) { return (unsigned char)clamp( atoi( s ), 0, 255 ); };
@@ -1525,6 +1888,52 @@ CON_COMMAND( triggerlook_set, "triggerlook_set <teleport|booster|push|gravity|ot
 		}
 	}
 	TL_LookChanged( mask );
+}
+
+std::string TL_PlayerSpray()
+{
+	static ICvar *s_pCvar = (ICvar *)TLP_Interface( "vstdlib", CVAR_INTERFACE_VERSION );
+	const ConVar *v = s_pCvar ? s_pCvar->FindVar( "cl_logofile" ) : NULL;
+	std::string f = v ? v->GetString() : "";
+	const size_t slash = f.find_last_of( "/\\" );
+	f = f.substr( slash == std::string::npos ? 0 : slash + 1 );
+	const size_t dot = f.rfind( '.' );
+	return dot != std::string::npos && dot > 0 ? f.substr( 0, dot ) : f;
+}
+
+// triggerlook_sky off | colour r g b | spray <name> | picture <name> | add <file>  (scripts, tests; the menu's SKYBOX)
+CON_COMMAND( triggerlook_sky, "triggerlook_sky off | colour r g b | spray <name> | picture <name> | add <file>: the custom skybox (every map)" )
+{
+	TLSky_t &sky = g_TLSky;
+	const char *what = args.ArgC() > 1 ? args[1] : "";
+	if ( !TL_StrICmp( what, "add" ) && args.ArgC() > 2 )
+	{
+		Msg( "triggerlook: %s\n", TLPics_Add( args.ArgS() + strlen( args[1] ) + 1 ) ? "adding the picture (the menu's SKYBOX page shows it when done)" : "busy" );
+		return;
+	}
+	TLPics_Refresh();
+	if ( !TL_StrICmp( what, "off" ) )
+		sky.mode = TL_SKY_OFF;
+	else if ( !TL_StrICmp( what, "colour" ) && args.ArgC() > 4 )
+	{
+		sky.mode = TL_SKY_COLOUR;
+		for ( int k = 0; k < 3; k++ )
+			sky.rgb[k] = (unsigned char)clamp( atoi( args[2 + k] ), 0, 255 );
+	}
+	else if ( ( !TL_StrICmp( what, "spray" ) || !TL_StrICmp( what, "picture" ) ) && args.ArgC() > 2 )
+	{
+		const bool spray = !TL_StrICmp( what, "spray" );
+		sky.mode = spray ? TL_SKY_SPRAY : TL_SKY_PICTURE;
+		( spray ? sky.spray : sky.picture ) = args[2];
+		if ( !TLPics_Find( spray, args[2] ) )
+			Warning( "triggerlook: no %s called %s\n", what, args[2] );
+	}
+	else
+	{
+		Msg( "usage: triggerlook_sky off | colour r g b | spray <name> | picture <name> | add <file>\n" );
+		return;
+	}
+	TL_SkyChanged();
 }
 
 // also appended to TLP_CacheDir()/info.txt (tests: the game's console.log isn't always there)
@@ -1576,10 +1985,19 @@ CON_COMMAND( triggerlook_info, "triggerlook: show what it's doing" )
 				s_LastCost.avg * 1e6, s_LastCost.max * 1e6, s_LastCost.secs, s_LastCost.draws, s_LastCost.reused, s_LastCost.frames,
 				s_LastCost.secs > 0 ? s_LastCost.frames / s_LastCost.secs : 0.0 );
 	out += line;
+	static const char *const s_SkyModes[] = { "off", "colour", "spray", "picture" };
+	snprintf( line, sizeof( line ), "  sky: %s %s (material %s, aspect %.3f), %d sky faces (%d triangles in %d meshes, %d drawn last frame, camera area %d), "
+				"stencil bits %d, in the leaf system %d, your spray \"%s\"; cost %.1f us average, %.1f us worst (%d draws in %.1f s)\n",
+				s_SkyModes[g_TLSky.mode & 3], g_TLSky.mode == TL_SKY_SPRAY ? g_TLSky.spray.c_str() : g_TLSky.mode == TL_SKY_PICTURE ? g_TLSky.picture.c_str() : "",
+				s_pSkyMaterial ? s_pSkyMaterial->GetName() : "none", s_flSkyAspect, (int)s_Map.m_SkyArea.size(), s_nSkyTris, (int)s_SkyMeshes.size(),
+				s_nSkyDrawn, s_nSkyCamArea, s_pMatSys ? s_pMatSys->StencilBufferBits() : -1, s_Sky.RenderHandle() != INVALID_CLIENT_RENDER_HANDLE,
+				TL_PlayerSpray().c_str(),
+				s_SkyLastCost.avg * 1e6, s_SkyLastCost.max * 1e6, s_SkyLastCost.draws, s_SkyLastCost.secs );
+	out += line;
 	Msg( "%s", out.c_str() );
 	char path[1024];
 	snprintf( path, sizeof( path ), "%s/info.txt", TLP_CacheDir() );
-	if ( FILE *f = fopen( path, "a" ) )
+	if ( FILE *f = TLP_Open( path, "a" ) )
 	{
 		fprintf( f, "[%.1f] %s", Plat_FloatTime(), out.c_str() );
 		fclose( f );

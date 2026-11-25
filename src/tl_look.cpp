@@ -12,12 +12,14 @@
 
 TLLook_t g_TLLook[TL_TYPES];
 int g_TLCustom[3] = { 255, 165, 0 };
-int g_nTLTypeVersion[TL_TYPES] = { 1, 2, 3, 4, 5, 6 };
+int g_nTLTypeVersion[TL_TYPES] = { 1, 2, 3, 4, 5, 6, 7, 8 };
 bool g_bTLShow;
 std::string g_TLPickKey, g_TLPickBind;
 static std::vector<std::string> s_KeepLines;	// lines this version doesn't know (another version's): written back		// the menu's ON / OFF: off = the game's own trigger look, nothing of ours
 std::vector<TLCustomTrigger_t> g_TLCT;
 int g_nTLCTListVersion;
+TLSky_t g_TLSky;
+int g_nTLSkyVersion;
 
 static int s_nVersion = TL_TYPES;	// mesh versions: every type and custom trigger gets its own number
 static bool s_bDirty;
@@ -35,10 +37,15 @@ void TL_LookDefaults()
 		l.border[0] = l.border[1] = l.border[2] = l.border[3] = 255;
 		l.width = 0;
 	}
-	// clips: hidden until asked for (there are many), pink so they don't pass for triggers
-	TLLook_t &c = g_TLLook[TL_CLIP];
-	c.show = false;
-	c.fill[0] = 255; c.fill[1] = 80; c.fill[2] = 200; c.fill[3] = 50;
+	// clips, invisible walls, nodraw: hidden until asked for (there are many), own colours so they don't pass for triggers
+	static const unsigned char s_Hidden[3][3] = { { 255, 80, 200 }, { 80, 200, 255 }, { 255, 220, 0 } };	// pink, light blue, yellow
+	for ( int k = 0; k < 3; k++ )
+	{
+		TLLook_t &c = g_TLLook[TL_CLIP + k];
+		c.show = false;
+		memcpy( c.fill, s_Hidden[k], 3 );
+		c.fill[3] = 50;
+	}
 	g_bTLShow = false;
 	g_TLPickKey.clear();
 	g_TLPickBind.clear();
@@ -46,6 +53,8 @@ void TL_LookDefaults()
 	g_TLCustom[0] = 255; g_TLCustom[1] = 165; g_TLCustom[2] = 0;
 	g_TLCT.clear();
 	g_nTLCTListVersion++;
+	g_TLSky = TLSky_t();
+	g_nTLSkyVersion++;
 }
 
 int TL_NewVersion() { return ++s_nVersion; }
@@ -66,6 +75,12 @@ void TL_CTChanged( int index )
 	TL_LookChanged( 0 );
 }
 
+void TL_SkyChanged()
+{
+	g_nTLSkyVersion++;
+	TL_LookChanged( 0 );
+}
+
 void TL_CTListChanged()
 {
 	g_nTLCTListVersion++;
@@ -80,18 +95,17 @@ void TL_LookTick( double now )
 		s_flChanged = now;
 	else if ( now - s_flChanged > 0.5 )
 	{
-		s_bDirty = false;
-		TL_LookSave();
+		if ( TL_LookSave() )
+			s_bDirty = false;
+		else
+			s_flChanged = now;	// shortcut: retried every 0.5 s, so a lasting failure warns that often, back off if anyone minds
 	}
 }
 
 void TL_LookFlush()
 {
 	if ( s_bDirty )
-	{
-		s_bDirty = false;
-		TL_LookSave();
-	}
+		s_bDirty = !TL_LookSave();
 }
 
 const char *TL_LookPath()
@@ -138,12 +152,13 @@ std::string TL_CleanName( const std::string &name )
 }
 
 // lines: "triggers 0/1" (ON / OFF), "<type> show 1 fill r g b a border r g b a width n", "custom r g b",
+// "sky off|colour r g b|spray <name>|picture <name>",
 // "ctname <name>" (the custom trigger on the line before) and
 // "ct <map> <model> <mins x y z> <maxs x y z> fill ... border ... width n"; anything unknown is skipped
 bool TL_LookLoad()
 {
 	TL_LookDefaults();
-	FILE *f = fopen( TL_LookPath(), "r" );
+	FILE *f = TLP_Open( TL_LookPath(), "r" );
 	if ( !f )
 		return false;
 	char line[512];
@@ -184,6 +199,21 @@ bool TL_LookLoad()
 			g_bTLShow = atoi( tok[1] ) != 0;
 			continue;
 		}
+		if ( !TL_StrICmp( tok[0], "sky" ) && n >= 2 )
+		{
+			static const char *const s_Modes[] = { "off", "colour", "spray", "picture" };
+			for ( int k = 0; k < 4; k++ )
+				if ( !TL_StrICmp( tok[1], s_Modes[k] ) && ( k != TL_SKY_COLOUR || n >= 5 ) && ( k < TL_SKY_SPRAY || n >= 3 ) )
+					g_TLSky.mode = k;
+			if ( g_TLSky.mode == TL_SKY_COLOUR )
+				for ( int k = 0; k < 3; k++ )
+					g_TLSky.rgb[k] = Byte( tok[2 + k] );
+			if ( g_TLSky.mode == TL_SKY_SPRAY )
+				g_TLSky.spray = tok[2];
+			else if ( g_TLSky.mode == TL_SKY_PICTURE )
+				g_TLSky.picture = tok[2];
+			continue;
+		}
 		if ( !TL_StrICmp( tok[0], "custom" ) && n >= 4 )
 		{
 			for ( int k = 0; k < 3; k++ )
@@ -221,6 +251,7 @@ bool TL_LookLoad()
 	for ( int t = 0; t < TL_TYPES; t++ )
 		g_nTLTypeVersion[t] = TL_NewVersion();
 	g_nTLCTListVersion++;
+	g_nTLSkyVersion++;
 	return true;
 }
 
@@ -228,7 +259,7 @@ bool TL_LookSave()
 {
 	char tmp[1100];
 	snprintf( tmp, sizeof( tmp ), "%s.tmp", TL_LookPath() );
-	FILE *f = fopen( tmp, "w" );
+	FILE *f = TLP_Open( tmp, "w" );
 	if ( !f )
 	{
 		Warning( "triggerlook: can't write %s\n", tmp );
@@ -245,6 +276,12 @@ bool TL_LookSave()
 				 l.fill[2], l.fill[3], l.border[0], l.border[1], l.border[2], l.border[3], l.width );
 	}
 	fprintf( f, "custom %d %d %d\n", g_TLCustom[0], g_TLCustom[1], g_TLCustom[2] );
+	const TLSky_t &sky = g_TLSky;
+	if ( sky.mode == TL_SKY_COLOUR )
+		fprintf( f, "sky colour %d %d %d\n", sky.rgb[0], sky.rgb[1], sky.rgb[2] );
+	else
+		fprintf( f, "sky %s%s\n", sky.mode == TL_SKY_SPRAY ? "spray " : sky.mode == TL_SKY_PICTURE ? "picture " : "off",
+				 sky.mode == TL_SKY_SPRAY ? sky.spray.c_str() : sky.mode == TL_SKY_PICTURE ? sky.picture.c_str() : "" );
 	for ( const TLCustomTrigger_t &ct : g_TLCT )
 	{
 		const TLLook_t &l = ct.look;

@@ -5,7 +5,8 @@
 // the convex solid inside its side planes), so each side is one polygon with its real edges - the drawn faces
 // of the map are cut into pieces by the compiler, which would draw borders across the middle of a side.
 // Each trigger also gets a type (TLType_t) from its class and outputs. Player clip brushes of the world are read the
-// same way, one "model" each (TL_CLIP, numbered after the map's own brush models).
+// same way, one "model" each (TL_CLIP, numbered after the map's own brush models), then the world's invisible walls
+// (TL_INVISIBLE, whole brushes) and the nodraw sides players can see (TL_NODRAW, one model per brush).
 //=============================================================================
 #ifndef TL_MAP_H
 #define TL_MAP_H
@@ -23,6 +24,8 @@ enum TLType_t
 	TL_GRAVITY,		// trigger_gravity, or a gravity output
 	TL_OTHER,		// every other trigger
 	TL_CLIP,		// a player clip brush of the world (not an entity)
+	TL_INVISIBLE,	// a world brush that blocks players and is never drawn (toolsinvisible sides, the rest nodraw / skip / hint)
+	TL_NODRAW,		// the toolsnodraw sides of a world brush that face open space (only those sides)
 	TL_TYPES
 };
 extern const char *const g_TLTypeName[TL_TYPES];	// "teleport", ... (settings file, console)
@@ -91,7 +94,7 @@ public:
 	// Areas (parts of the map split by area portals; the game draws nothing, and servers send nothing, from an area
 	// that only joins the camera's through closed portals): BoxClusters' areas = the ones a box touches, the area a
 	// point is in (0 = solid / outside / the map has no areas), and AreaFlood = the areas drawn from there
-	int PointArea( const Vector &p ) const;
+	int PointArea( const Vector &p, long long *budget = NULL ) const;	// (budget: tree steps left, counted down)
 	bool AreaFlood( int area, std::vector<unsigned char> &bits ) const;
 	int NumAreas() const { return (int)m_Areas.size(); }
 	int		m_nPortalsShut = 0;		// area portals closed for good (a func_areaportal nothing can open)
@@ -101,13 +104,20 @@ public:
 	std::vector<Vector> m_OccVerts;
 	std::vector<int> m_OccFirst;
 	std::vector<std::string> m_OccMaterials;
+	// the world's sky faces (2D / 3D sky: the engine draws nothing there, the sky shows through), world space:
+	// polygon k = m_SkyVerts[m_SkyFirst[k], m_SkyFirst[k + 1]), m_SkyArea[k] = the area it's seen from (0 = unknown)
+	std::vector<Vector> m_SkyVerts;
+	std::vector<int> m_SkyFirst, m_SkyArea;
+	// the world's water (warp) faces, the same way: the custom sky leaves them alone (cheap water writes no depth)
+	std::vector<Vector> m_WaterVerts;
+	std::vector<int> m_WaterFirst;
 
 private:
 	struct Plane_t { Vector n; float d; };
 	struct Node_t { int plane, child[2]; };
 	struct Area_t { int first, count; };		// into m_Portals (checked at load)
 	struct Portal_t { int other; bool open; };	// one side of an area portal: the area it leads to
-	int PointLeaf( const Vector &p ) const;
+	int PointLeaf( const Vector &p, long long *budget = NULL ) const;
 	std::vector<Plane_t> m_Planes;
 	std::vector<Node_t> m_Nodes;
 	std::vector<short> m_LeafCluster;

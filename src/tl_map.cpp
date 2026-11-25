@@ -15,8 +15,8 @@ extern "C" {
 #include "../utils/lzma/C/LzmaDec.h"
 }
 
-const char *const g_TLTypeName[TL_TYPES] = { "teleport", "booster", "push", "gravity", "other", "clip" };
-const char *const g_TLTypeLabel[TL_TYPES] = { "TELEPORT", "BOOSTER", "PUSH", "GRAVITY", "OTHER", "CLIPS" };
+const char *const g_TLTypeName[TL_TYPES] = { "teleport", "booster", "push", "gravity", "other", "clip", "invisible", "nodraw" };
+const char *const g_TLTypeLabel[TL_TYPES] = { "TELEPORT", "BOOSTER", "PUSH", "GRAVITY", "OTHER", "CLIPS", "INVISIBLES", "NODRAWS" };
 
 int TL_Classify( const char *classname, const char *outputs )
 {
@@ -64,7 +64,11 @@ namespace
 	const long long MAX_LUMP = 256ll * 1024 * 1024, MAX_UNPACKED = 64u * 1024 * 1024;
 	const int MAX_BRUSH_SIDES = 128;		// vbsp's own limit
 	const int CONTENTS_PLAYERCLIP = 0x10000;	// tools/toolsclip, tools/toolsplayerclip
+	const int CONTENTS_BLOCKS = 0x1 | 0x2 | 0x8 | 0x4000;	// solid, window, grate (toolsinvisible), moveable: stops players
 	const long long MAX_CHOPS = 2000000;	// polygon clips per map (bhop_exodus needs ~40k)
+	const long long MAX_WALK = 8000000;		// tree steps per map for the load's point lookups (nodraw sides facing open
+											// space, sky faces' areas): the local maps need at most 1.9M (bhop_mellifluous);
+											// a crafted map's looping tree costs 4096 a point
 
 	// a lump running a little past the end of the file (seen: an entity lump 1 byte too long, the game loads the
 	// map fine) is read as far as there is data, the rest zeros
@@ -125,23 +129,16 @@ namespace
 	};
 
 	// the engine's order: custom/<folder>/ first, then the game folder, then download/
-	struct FindInCustom_t { const char *customDir, *level; char *found; int foundLen; bool ok; };
-	void TryCustomFolder( const char *name, void *ctx )
-	{
-		FindInCustom_t *f = (FindInCustom_t *)ctx;
-		if ( f->ok )
-			return;
-		snprintf( f->found, f->foundLen, "%s/%s/%s", f->customDir, name, f->level );
-		f->ok = TLP_IsFile( f->found );
-	}
-
 	bool FindMap( const char *gameDir, const char *level, char *found, int foundLen )
 	{
-		char customDir[1024];
-		snprintf( customDir, sizeof( customDir ), "%s/custom", gameDir );
-		FindInCustom_t f = { customDir, level, found, foundLen, false };
-		TLP_ListDir( customDir, TryCustomFolder, &f );
-		if ( f.ok ) return true;
+		std::vector<TLPEntry_t> custom;
+		TLP_List( std::string( gameDir ) + "/custom", custom );
+		for ( const TLPEntry_t &e : custom )
+		{
+			snprintf( found, foundLen, "%s/custom/%s/%s", gameDir, e.name.c_str(), level );
+			if ( TLP_IsFile( found ) )
+				return true;
+		}
 		snprintf( found, foundLen, "%s/%s", gameDir, level );
 		if ( TLP_IsFile( found ) ) return true;
 		snprintf( found, foundLen, "%s/download/%s", gameDir, level );
@@ -278,8 +275,16 @@ namespace
 		return (float)( fabs( s - v ) < 0.01 ? s : v );
 	}
 
+	// want( side index ) before a side is cut out, keep( side index, its polygon, normal ) after: which sides to add
+	// (all for triggers, clips and invisible walls)
+	struct AllSides
+	{
+		bool operator()( int ) const { return true; }
+		bool operator()( int, const std::vector<DV> &, const Vector & ) const { return true; }
+	};
+	template <class Want = AllSides, class Keep = AllSides>
 	void AddBrush( const dbrush_t &b, const dbrushside_t *pSides, int nSides, const dplane_t *pPlanes, int nPlanes, TLModel_t &m,
-				   long long &chops, int brushId )
+				   long long &chops, int brushId, Want want = Want(), Keep keep = Keep() )
 	{
 		if ( b.firstside < 0 || b.numsides <= 0 || b.numsides > MAX_BRUSH_SIDES || b.firstside > nSides - b.numsides )
 			return;
@@ -287,7 +292,7 @@ namespace
 		std::vector<DV> w;
 		for ( int i = 0; i < b.numsides; i++ )
 		{
-			if ( sides[i].bevel || sides[i].planenum >= nPlanes )
+			if ( sides[i].bevel || sides[i].planenum >= nPlanes || !want( i ) )
 				continue;
 			bool dup = false;
 			for ( int j = 0; j < i && !dup; j++ )
@@ -320,7 +325,7 @@ namespace
 			bool outside = false;
 			for ( const DV &p : clean )
 				outside = outside || !( fabs( p.x ) < 33000 && fabs( p.y ) < 33000 && fabs( p.z ) < 33000 );
-			if ( outside || ++chops > MAX_CHOPS )
+			if ( outside || ++chops > MAX_CHOPS || !keep( i, clean, pl.normal ) )
 				continue;
 			DV area = { 0, 0, 0 };
 			for ( size_t k = 0; k < clean.size(); k++ )
@@ -330,14 +335,29 @@ namespace
 				continue;
 			if ( a2 > 0 )
 				std::reverse( clean.begin(), clean.end() );		// the map's faces are clockwise from the front
+			// on the grid; then repeated corners and corners turning the wrong way (rounding noise where many planes nearly
+			// meet: a cone's tip) dropped
+			std::vector<Vector> pts;
+			for ( const DV &p : clean )
+				pts.push_back( Vector( Snap( p.x ), Snap( p.y ), Snap( p.z ) ) );
+			for ( size_t k = 0; pts.size() > 3 && k < pts.size(); )
+			{
+				const Vector &pa = pts[( k + pts.size() - 1 ) % pts.size()], &pb = pts[k], &pc = pts[( k + 1 ) % pts.size()];
+				if ( pb.DistToSqr( pc ) < 1e-4f || DotProduct( CrossProduct( pb - pa, pc - pb ), pl.normal ) > 0 )
+				{
+					pts.erase( pts.begin() + k );
+					k = 0;
+				}
+				else
+					k++;
+			}
 			TLPoly_t poly;
 			poly.first = (int)m.verts.size();
-			poly.count = (int)clean.size();
+			poly.count = (int)pts.size();
 			poly.normal = pl.normal;
 			poly.brush = brushId;
-			for ( const DV &p : clean )
+			for ( const Vector &v : pts )
 			{
-				Vector v( Snap( p.x ), Snap( p.y ), Snap( p.z ) );
 				m.verts.push_back( v );
 				VectorMin( m.mins, v, m.mins );
 				VectorMax( m.maxs, v, m.maxs );
@@ -362,6 +382,11 @@ void CTLMap::Clear()
 	m_OccVerts.clear();
 	m_OccFirst.clear();
 	m_OccMaterials.clear();
+	m_SkyVerts.clear();
+	m_SkyFirst.clear();
+	m_SkyArea.clear();
+	m_WaterVerts.clear();
+	m_WaterFirst.clear();
 	m_ClusterMark.clear();
 	m_NodeMark.clear();
 	memset( m_nTriggers, 0, sizeof( m_nTriggers ) );
@@ -402,12 +427,14 @@ bool CTLMap::Load( const char *pszGameDir, const char *pszLevel, TLOpenMapFn pfn
 	std::vector<unsigned char> areas, areaportals;
 	if ( ok && !( ReadLump( *file, size, h, LUMP_AREAS, areas ) && ReadLump( *file, size, h, LUMP_AREAPORTALS, areaportals ) ) )
 		areas.clear();		// (same)
-	// the world's faces + their materials (only when asked: solid-looking see-through surfaces)
+	// the materials (brush sides: invisible walls, nodraw) and the world's faces (sky faces, solid-looking see-through ones)
 	std::vector<unsigned char> faces, texinfo, texdata, strdata, strtable, vertexes, edgesL, surfedges;
-	bool occOk = ok && pfnSolidLooking && ReadLump( *file, size, h, LUMP_FACES, faces ) && ReadLump( *file, size, h, LUMP_TEXINFO, texinfo ) &&
-				 ReadLump( *file, size, h, LUMP_TEXDATA, texdata ) && ReadLump( *file, size, h, LUMP_TEXDATA_STRING_DATA, strdata ) &&
-				 ReadLump( *file, size, h, LUMP_TEXDATA_STRING_TABLE, strtable ) && ReadLump( *file, size, h, LUMP_VERTEXES, vertexes ) &&
-				 ReadLump( *file, size, h, LUMP_EDGES, edgesL ) && ReadLump( *file, size, h, LUMP_SURFEDGES, surfedges );
+	if ( ok && !( ReadLump( *file, size, h, LUMP_TEXINFO, texinfo ) && ReadLump( *file, size, h, LUMP_TEXDATA, texdata ) &&
+				  ReadLump( *file, size, h, LUMP_TEXDATA_STRING_DATA, strdata ) && ReadLump( *file, size, h, LUMP_TEXDATA_STRING_TABLE, strtable ) ) )
+		texinfo.clear();	// (no invisible walls / nodraw / sky then)
+	const bool facesOk = ok && !texinfo.empty() && ReadLump( *file, size, h, LUMP_FACES, faces ) && ReadLump( *file, size, h, LUMP_VERTEXES, vertexes ) &&
+						 ReadLump( *file, size, h, LUMP_EDGES, edgesL ) && ReadLump( *file, size, h, LUMP_SURFEDGES, surfedges );
+	const bool occOk = facesOk && pfnSolidLooking;
 	delete file;
 	// leaf layout: version 0 has the ambient light cube (56 bytes), version 1 doesn't (32); the brush list is at 24
 	int leafSize = h.lumps[LUMP_LEAFS].version == 0 ? 56 : h.lumps[LUMP_LEAFS].version == 1 ? 32 : 0;
@@ -430,6 +457,58 @@ bool CTLMap::Load( const char *pszGameDir, const char *pszLevel, TLOpenMapFn pfn
 	int nPlanes = (int)planes.size() / sizeof( dplane_t ), nNodes = (int)nodes.size() / sizeof( dnode_t ), nLeafs = (int)leafs.size() / leafSize;
 	int nModels = (int)models.size() / sizeof( dmodel_t ), nLeafBrushes = (int)leafbrushes.size() / 2;
 	int nBrushes = (int)brushes.size() / sizeof( dbrush_t ), nSides = (int)brushsides.size() / sizeof( dbrushside_t );
+	const int nTexinfo = (int)( texinfo.size() / 72 ), nTexdata = (int)( texdata.size() / 32 ), nStr = (int)( strtable.size() / 4 );
+
+	// a material's name ("TOOLS/TOOLSNODRAW", as in the map) by texdata index; "" = unknown
+	auto materialOf = [&]( int td, char *name, int len )
+	{
+		int sid, so = -1, n = 0;
+		if ( td >= 0 && td < nTexdata )
+		{
+			memcpy( &sid, texdata.data() + (size_t)td * 32 + 12, 4 );
+			if ( sid >= 0 && sid < nStr )
+				memcpy( &so, strtable.data() + (size_t)sid * 4, 4 );
+		}
+		for ( ; so >= 0 && so + n < (int)strdata.size() && strdata[so + n] && n < len - 1; n++ )
+			name[n] = (char)strdata[so + n];
+		name[n] = 0;
+	};
+	// what a brush side's material is: 0 anything else, 1 toolsinvisible(ladder), 2 toolsnodraw, 3 toolsskip / toolshint
+	// (by its name in any folder: maps pack their own copies of the tool textures)
+	std::vector<signed char> toolOf( nTexinfo, -1 );
+	auto toolKind = [&]( int ti ) -> int
+	{
+		if ( ti < 0 || ti >= nTexinfo )
+			return 0;
+		if ( toolOf[ti] < 0 )
+		{
+			int td;
+			char name[260];
+			memcpy( &td, texinfo.data() + (size_t)ti * 72 + 68, 4 );
+			materialOf( td, name, sizeof( name ) );
+			const char *base = name;
+			for ( const char *c = name; *c; c++ )
+				if ( *c == '/' || *c == '\\' )
+					base = c + 1;
+			toolOf[ti] = !TL_StrICmp( base, "toolsinvisible" ) || !TL_StrICmp( base, "toolsinvisibleladder" ) ? 1
+					   : !TL_StrICmp( base, "toolsnodraw" ) ? 2 : !TL_StrICmp( base, "toolsskip" ) || !TL_StrICmp( base, "toolshint" ) ? 3 : 0;
+		}
+		return toolOf[ti];
+	};
+	// a brush: TL_CLIP (player clip), TL_INVISIBLE (stops players, toolsinvisible sides, the rest never drawn),
+	// TL_NODRAW (has nodraw sides), else -1
+	auto brushKind = [&]( const dbrush_t &br )
+	{
+		if ( br.contents & CONTENTS_PLAYERCLIP )
+			return (int)TL_CLIP;
+		if ( br.firstside < 0 || br.numsides <= 0 || br.numsides > MAX_BRUSH_SIDES || br.firstside > nSides - br.numsides )
+			return -1;
+		int count[4] = {};
+		for ( int i = 0; i < br.numsides; i++ )
+			if ( !pSides[br.firstside + i].bevel )
+				count[toolKind( pSides[br.firstside + i].texinfo )]++;
+		return count[1] && !count[0] && ( br.contents & CONTENTS_BLOCKS ) ? (int)TL_INVISIBLE : count[2] ? (int)TL_NODRAW : -1;
+	};
 
 	m_Models.resize( nModels );
 	std::vector<char> seen( nBrushes, 0 ), nodeSeen( nNodes, 0 );
@@ -490,6 +569,15 @@ bool CTLMap::Load( const char *pszGameDir, const char *pszLevel, TLOpenMapFn pfn
 	for ( int mi = 1; mi < nModels && mi < (int)ent.size(); mi++ )
 	{
 		int type = TL_Classify( ent[mi].classname.c_str(), ent[mi].outputs.c_str() );
+		if ( type < 0 && ( ent[mi].classname.empty() || !TL_StrICmp( ent[mi].classname.c_str(), "func_illusionary" ) ) )
+			continue;
+		modelBrushes( mi );
+		// any other brush entity made of invisible walls only (an invisible func_door / func_brush ...) is one too
+		for ( size_t k = 0; k < used.size() && type < 0; k++ )
+			if ( brushKind( pBrushes[used[k]] ) != TL_INVISIBLE )
+				break;
+			else if ( k + 1 == used.size() )
+				type = TL_INVISIBLE;
 		if ( type < 0 )
 			continue;
 		TLModel_t &m = m_Models[mi];
@@ -499,34 +587,74 @@ bool CTLMap::Load( const char *pszGameDir, const char *pszLevel, TLOpenMapFn pfn
 		m.angles = ent[mi].angles;
 		m.mins.Init( FLT_MAX, FLT_MAX, FLT_MAX );
 		m.maxs.Init( -FLT_MAX, -FLT_MAX, -FLT_MAX );
-		modelBrushes( mi );
 		for ( size_t k = 0; k < used.size(); k++ )
 			AddBrush( pBrushes[used[k]], pSides, nSides, pPlanes, nPlanes, m, chops, (int)k );
 		finish( m );
 	}
-	// the world's player clips: one model each, after the brush models (in the world's brush order, so the numbers
-	// stay the same for the same file: custom triggers keep them)
+	// does a brush side face open space (not buried in a wall): the world leaf just in front of its middle or of a
+	// point near a corner isn't solid. Past the map's walk budget: "solid" (a looping tree mustn't stall the load)
+	long long walk = MAX_WALK;
+	auto leafSolid = [&]( const DV &p )
+	{
+		int n = nModels > 0 ? pModels[0].headnode : -1;
+		for ( int steps = 0; n >= 0 && steps < 4096; steps++ )
+		{
+			if ( --walk < 0 )
+				return true;
+			if ( n >= nNodes || pNodes[n].planenum < 0 || pNodes[n].planenum >= nPlanes )
+				return true;
+			const dplane_t &pl = pPlanes[pNodes[n].planenum];
+			n = pNodes[n].children[p.x * pl.normal.x + p.y * pl.normal.y + p.z * pl.normal.z - pl.dist >= 0 ? 0 : 1];
+		}
+		int contents = 1;
+		if ( n < 0 && -1 - n < nLeafs )
+			memcpy( &contents, leafs.data() + (size_t)( -1 - n ) * leafSize, 4 );
+		return ( contents & 1 ) != 0;
+	};
+	auto facesOpen = [&]( const std::vector<DV> &w, const Vector &normal )
+	{
+		DV c = { 0, 0, 0 }, out = { normal.x, normal.y, normal.z };
+		for ( const DV &p : w )
+			c = c + p;
+		c = c * ( 1.0 / w.size() );
+		for ( int k = -1; k < (int)w.size(); k++ )
+			if ( !leafSolid( ( k < 0 ? c : w[k] + ( c - w[k] ) * 0.2 ) + out ) )
+				return true;
+		return false;
+	};
+	// the world's player clips, invisible walls and brushes with nodraw sides: one model each, after the brush models,
+	// kind by kind in the world's brush order (the numbers stay the same for the same file: custom triggers keep them)
 	if ( nModels > 0 )
 	{
 		modelBrushes( 0 );
 		std::sort( used.begin(), used.end() );
-		for ( int b : used )
-		{
-			if ( !( pBrushes[b].contents & CONTENTS_PLAYERCLIP ) )
-				continue;
-			TLModel_t m;
-			m.type = TL_CLIP;
-			m.classname = "playerclip";
-			m.origin.Init();
-			m.angles.Init();
-			m.mins.Init( FLT_MAX, FLT_MAX, FLT_MAX );
-			m.maxs.Init( -FLT_MAX, -FLT_MAX, -FLT_MAX );
-			AddBrush( pBrushes[b], pSides, nSides, pPlanes, nPlanes, m, chops, 0 );
-			if ( m.polys.empty() )
-				continue;
-			m_Models.push_back( std::move( m ) );
-			finish( m_Models.back() );
-		}
+		std::vector<signed char> kindOf( used.size() );
+		for ( size_t u = 0; u < used.size(); u++ )
+			kindOf[u] = (signed char)brushKind( pBrushes[used[u]] );
+		static const char *const s_Class[] = { "playerclip", "toolsinvisible", "toolsnodraw" };
+		for ( int type = TL_CLIP; type <= TL_NODRAW; type++ )
+			for ( size_t u = 0; u < used.size(); u++ )
+			{
+				if ( kindOf[u] != type )
+					continue;
+				const dbrush_t &br = pBrushes[used[u]];
+				TLModel_t m;
+				m.type = type;
+				m.classname = s_Class[type - TL_CLIP];
+				m.origin.Init();
+				m.angles.Init();
+				m.mins.Init( FLT_MAX, FLT_MAX, FLT_MAX );
+				m.maxs.Init( -FLT_MAX, -FLT_MAX, -FLT_MAX );
+				if ( type == TL_NODRAW )		// only its nodraw sides a player could see
+					AddBrush( br, pSides, nSides, pPlanes, nPlanes, m, chops, 0, [&]( int i ) { return toolKind( pSides[br.firstside + i].texinfo ) == 2; },
+							  [&]( int, const std::vector<DV> &w, const Vector &n ) { return facesOpen( w, n ); } );
+				else
+					AddBrush( br, pSides, nSides, pPlanes, nPlanes, m, chops, 0 );
+				if ( m.polys.empty() )
+					continue;
+				m_Models.push_back( std::move( m ) );
+				finish( m_Models.back() );
+			}
 	}
 	// visibility: the world's tree (planes, nodes, each leaf's cluster + area) + the PVS lump + the areas and their
 	// portals, checked so lookups stay inside
@@ -582,18 +710,44 @@ bool CTLMap::Load( const char *pszGameDir, const char *pszLevel, TLOpenMapFn pfn
 		}
 	}
 	if ( chops > MAX_CHOPS )
-		Warning( "triggerlook: %s: too many trigger brush sides, the rest are left out\n", path );
+		Warning( "triggerlook: %s: too many brush sides, the rest are left out\n", path );
+	if ( walk < 0 )
+		Warning( "triggerlook: %s: its tree is too deep or loops: nodraw sides / sky areas left out\n", path );
 
-	// solid-looking see-through world surfaces: each world face (not sky / nodraw / displacement) whose material the
-	// callback names, as a polygon. Everything bounds checked (maps come from servers).
-	if ( occOk && nModels > 0 )
+	// the world's faces: sky faces (their area: where they're seen from), and the solid-looking see-through surfaces
+	// (not sky / nodraw / displacement) whose material the callback names, as polygons. Everything bounds checked (maps
+	// come from servers).
+	if ( facesOk && nModels > 0 )
 	{
-		const int nFaces = (int)( faces.size() / sizeof( dface_t ) ), nTexinfo = (int)( texinfo.size() / 72 );
-		const int nTexdata = (int)( texdata.size() / 32 ), nStr = (int)( strtable.size() / 4 ), nVerts = (int)( vertexes.size() / 12 );
+		const int nFaces = (int)( faces.size() / sizeof( dface_t ) ), nVerts = (int)( vertexes.size() / 12 );
 		const int nEdges = (int)( edgesL.size() / sizeof( dedge_t ) ), nSurf = (int)( surfedges.size() / 4 );
 		std::vector<signed char> solidOf( nTexdata, -1 );	// per material: -1 not asked yet, 0 no, 1 yes
+		// a face's corners onto the end of out (false: broken, nothing added)
+		auto corners = [&]( const dface_t &f, std::vector<Vector> &out )
+		{
+			const size_t start = out.size();
+			for ( int k = 0; k < f.numedges; k++ )
+			{
+				int se;
+				memcpy( &se, surfedges.data() + (size_t)( f.firstedge + k ) * 4, 4 );
+				const unsigned int e = se < 0 ? 0u - (unsigned int)se : (unsigned int)se;
+				dedge_t ed;
+				if ( e < (unsigned int)nEdges )
+					memcpy( &ed, edgesL.data() + (size_t)e * sizeof( dedge_t ), sizeof( ed ) );
+				const int v = e < (unsigned int)nEdges ? ( se >= 0 ? ed.v[0] : ed.v[1] ) : nVerts;
+				if ( v >= nVerts )
+				{
+					out.resize( start );
+					return false;
+				}
+				Vector p;
+				memcpy( &p, vertexes.data() + (size_t)v * 12, 12 );
+				out.push_back( p );
+			}
+			return true;
+		};
 		const int first = pModels[0].firstface, count = pModels[0].numfaces;
-		for ( int fi = MAX( first, 0 ); fi < first + count && fi < nFaces && (int)m_OccVerts.size() < 1000000; fi++ )
+		for ( int fi = MAX( first, 0 ); fi < first + count && fi < nFaces && (int)( m_OccVerts.size() + m_SkyVerts.size() + m_WaterVerts.size() ) < 1000000; fi++ )
 		{
 			dface_t f;
 			memcpy( &f, faces.data() + (size_t)fi * sizeof( dface_t ), sizeof( f ) );
@@ -603,21 +757,33 @@ bool CTLMap::Load( const char *pszGameDir, const char *pszLevel, TLOpenMapFn pfn
 			int tiFlags, td;
 			memcpy( &tiFlags, texinfo.data() + (size_t)f.texinfo * 72 + 64, 4 );
 			memcpy( &td, texinfo.data() + (size_t)f.texinfo * 72 + 68, 4 );
-			if ( ( tiFlags & ( 0x2 | 0x4 | 0x80 | 0x100 | 0x200 ) ) || td < 0 || td >= nTexdata )
+			if ( ( tiFlags & ( 0x2 | 0x4 ) ) && f.planenum < nPlanes )
+			{
+				// 2D / 3D sky: the area of the point just in front of its middle
+				const int start = (int)m_SkyVerts.size();
+				if ( !corners( f, m_SkyVerts ) )
+					continue;
+				Vector c( 0, 0, 0 );
+				for ( int k = start; k < (int)m_SkyVerts.size(); k++ )
+					c += m_SkyVerts[k];
+				c /= (float)f.numedges;
+				m_SkyFirst.push_back( start );
+				m_SkyArea.push_back( PointArea( c + pPlanes[f.planenum].normal, &walk ) );	// (planenum is the face's own, facing the room)
+				continue;
+			}
+			if ( tiFlags & 0x8 )
+			{
+				const int start = (int)m_WaterVerts.size();	// water (warp)
+				if ( corners( f, m_WaterVerts ) )
+					m_WaterFirst.push_back( start );
+				continue;
+			}
+			if ( !occOk || ( tiFlags & ( 0x2 | 0x4 | 0x80 | 0x100 | 0x200 ) ) || td < 0 || td >= nTexdata )
 				continue;		// 2D / 3D sky, nodraw, hint, skip
 			if ( solidOf[td] < 0 )
 			{
-				int sid, so = -1;
-				memcpy( &sid, texdata.data() + (size_t)td * 32 + 12, 4 );
-				if ( sid >= 0 && sid < nStr )
-					memcpy( &so, strtable.data() + (size_t)sid * 4, 4 );
-				char name[260] = "";
-				if ( so >= 0 && so < (int)strdata.size() )
-				{
-					int n = 0;
-					while ( so + n < (int)strdata.size() && strdata[so + n] && n < (int)sizeof( name ) - 1 ) { name[n] = (char)strdata[so + n]; n++; }
-					name[n] = 0;
-				}
+				char name[260];
+				materialOf( td, name, sizeof( name ) );
 				solidOf[td] = name[0] && pfnSolidLooking( name ) ? 1 : 0;
 				if ( solidOf[td] )
 					m_OccMaterials.push_back( name );
@@ -625,41 +791,22 @@ bool CTLMap::Load( const char *pszGameDir, const char *pszLevel, TLOpenMapFn pfn
 			if ( !solidOf[td] )
 				continue;
 			const int start = (int)m_OccVerts.size();
-			bool good = true;
-			for ( int k = 0; k < f.numedges && good; k++ )
-			{
-				int se;
-				memcpy( &se, surfedges.data() + (size_t)( f.firstedge + k ) * 4, 4 );
-				const unsigned int e = se < 0 ? 0u - (unsigned int)se : (unsigned int)se;
-				good = e < (unsigned int)nEdges;
-				if ( !good )
-					break;
-				dedge_t ed;
-				memcpy( &ed, edgesL.data() + (size_t)e * sizeof( dedge_t ), sizeof( ed ) );
-				const int v = se >= 0 ? ed.v[0] : ed.v[1];
-				good = v < nVerts;
-				if ( good )
-				{
-					Vector p;
-					memcpy( &p, vertexes.data() + (size_t)v * 12, 12 );
-					m_OccVerts.push_back( p );
-				}
-			}
-			if ( !good )
-			{
-				m_OccVerts.resize( start );
-				continue;
-			}
-			m_OccFirst.push_back( start );
+			if ( corners( f, m_OccVerts ) )
+				m_OccFirst.push_back( start );
 		}
 		if ( !m_OccFirst.empty() )
 			m_OccFirst.push_back( (int)m_OccVerts.size() );
+		if ( !m_SkyFirst.empty() )
+			m_SkyFirst.push_back( (int)m_SkyVerts.size() );
+		if ( !m_WaterFirst.empty() )
+			m_WaterFirst.push_back( (int)m_WaterVerts.size() );
 	}
 	TL_StrCopy( m_szLevel, pszLevel, sizeof( m_szLevel ) );
-	Msg( "triggerlook: %s: %d teleport, %d booster, %d push, %d gravity, %d other triggers, %d clips (%d sides), %d vis clusters, "
-		 "%d areas (%d portals closed for good)\n", path,
+	Msg( "triggerlook: %s: %d teleport, %d booster, %d push, %d gravity, %d other triggers, %d clips, %d invisible walls, %d with nodraw "
+		 "sides (%d sides), %d sky faces, %d vis clusters, %d areas (%d portals closed for good)\n", path,
 		 m_nTriggers[TL_TELEPORT], m_nTriggers[TL_BOOSTER], m_nTriggers[TL_PUSH], m_nTriggers[TL_GRAVITY], m_nTriggers[TL_OTHER],
-		 m_nTriggers[TL_CLIP], m_nPolys, m_nClusters, (int)m_Areas.size(), m_nPortalsShut );
+		 m_nTriggers[TL_CLIP], m_nTriggers[TL_INVISIBLE], m_nTriggers[TL_NODRAW], m_nPolys, (int)m_SkyArea.size(), m_nClusters,
+		 (int)m_Areas.size(), m_nPortalsShut );
 	if ( !m_OccFirst.empty() )
 		Msg( "triggerlook: %s: %d surfaces look solid but are drawn see-through (%d materials, first: %s): they hide the triggers behind them\n",
 			 path, (int)m_OccFirst.size() - 1, (int)m_OccMaterials.size(), m_OccMaterials[0].c_str() );
@@ -742,11 +889,11 @@ int CTLMap::PointCluster( const Vector &p ) const
 	return cl < m_nClusters ? cl : -1;
 }
 
-int CTLMap::PointArea( const Vector &p ) const
+int CTLMap::PointArea( const Vector &p, long long *budget ) const
 {
 	if ( m_Areas.empty() )
 		return 0;
-	int leaf = PointLeaf( p );
+	int leaf = PointLeaf( p, budget );
 	return leaf >= 0 && leaf < (int)m_LeafArea.size() ? m_LeafArea[leaf] : 0;
 }
 
@@ -776,14 +923,16 @@ bool CTLMap::AreaFlood( int area, std::vector<unsigned char> &bits ) const
 	return true;
 }
 
-// the leaf a point is in (-1 = no tree)
-int CTLMap::PointLeaf( const Vector &p ) const
+// the leaf a point is in (-1 = no tree, or the budget ran out)
+int CTLMap::PointLeaf( const Vector &p, long long *budget ) const
 {
 	if ( m_Nodes.empty() )
 		return -1;
 	int n = m_nWorldHead;
 	for ( int steps = 0; n >= 0 && steps < 4096; steps++ )
 	{
+		if ( budget && --*budget < 0 )
+			return -1;
 		if ( n >= (int)m_Nodes.size() || m_Nodes[n].plane < 0 || m_Nodes[n].plane >= (int)m_Planes.size() )
 			return -1;
 		const Plane_t &pl = m_Planes[m_Nodes[n].plane];

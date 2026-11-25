@@ -43,6 +43,20 @@ std::string TL_CleanName( const std::string &name );
 extern std::vector<TLCustomTrigger_t> g_TLCT;	// every map's
 extern int g_nTLCTListVersion;					// bumped when one is added or deleted
 
+// the custom skybox (the menu's SKYBOX, triggerlook_sky): every map, whether the triggers are ON or OFF. Settings line
+// "sky off" | "sky colour r g b" | "sky spray <name>" | "sky picture <name>" (sprays: materials/vgui/logos/<name>.vtf,
+// pictures: materials/triggerlook/sky/<name>.vtf, added in the menu)
+enum { TL_SKY_OFF, TL_SKY_COLOUR, TL_SKY_SPRAY, TL_SKY_PICTURE };
+struct TLSky_t
+{
+	int				mode = TL_SKY_OFF;
+	unsigned char	rgb[3] = { 40, 40, 40 };
+	std::string		spray, picture;		// (all kept while playing: switching back finds the last one)
+};
+extern TLSky_t g_TLSky;
+extern int g_nTLSkyVersion;			// a new number on every change (the runtime picks its material again)
+void TL_SkyChanged();				// after editing g_TLSky: saved soon
+
 void TL_LookDefaults();
 void TL_LookChanged( int typeMask = ( 1 << TL_TYPES ) - 1 );	// after editing g_TLLook / g_TLCustom: rebuild those types + save soon
 void TL_CTChanged( int index );			// after editing g_TLCT[index].look

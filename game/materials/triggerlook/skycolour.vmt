@@ -1,0 +1,9 @@
+// triggerlook: the custom skybox's solid colour (colour per vertex, from the menu's SKYBOX), unlit, no depth, no fog
+"UnlitGeneric"
+{
+	"$basetexture" "vgui/white"
+	"$vertexcolor" 1
+	"$ignorez" 1
+	"$nocull" 1
+	"$nofog" 1
+}
